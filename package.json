@@ -1,0 +1,23 @@
+{
+  "name": "lumiverse-spine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:backend": "bun build src/backend.ts --outfile dist/backend.js --target bun",
+    "build:frontend": "bun build src/frontend.ts --outfile dist/frontend.js --target browser --banner '/*! Includes the Spine Runtimes, Copyright (c) 2013-2019 Esoteric Software LLC, under the Spine Runtimes License Agreement in LICENSE-spine-runtimes. */'",
+    "build": "bun run build:backend && bun run build:frontend",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@esotericsoftware/spine-core": "4.1.56",
+    "@esotericsoftware/spine-webgl": "4.1.56",
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.4.0",
+    "lumiverse-spindle-types": "^0.6.23",
+    "typescript": "^5.9.3"
+  }
+}

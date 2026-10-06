@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "name": "Spine Avatars",
+  "identifier": "spine_avatars",
+  "author": "isiggy",
+  "github": "https://github.com/isiggy/Lumiverse-Spine-Public",
+  "homepage": "https://github.com/isiggy/Lumiverse-Spine-Public",
+  "description": "Use Spine animated models as character avatars. Imports Spine 4.1 model ZIPs, plays animations from LLM-classified emotions, with per-character render scale, zoom, rotation, playback speed and premultiplied-alpha controls.",
+  "permissions": [
+    "generation",
+    "characters",
+    "chats",
+    "chat_mutation",
+    "app_manipulation"
+  ],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.0.6"
+}

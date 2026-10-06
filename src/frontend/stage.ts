@@ -1,0 +1,1038 @@
+/**
+ * The Spine stage: owns the WebGL canvas, the loaded skeleton and its
+ * animation state, the render loop, and interaction (drag to move, click to
+ * play the click animation). The canvas is drawn into a Lumiverse app overlay
+ * or the settings tab's preview box, like the Live2D Avatars extension.
+ *
+ * Layout model, all read from the per-model settings every frame:
+ * - the model's reference bounds (its visible parts at frame 0 of the idle
+ *   animation) are scaled to fit the stage at zoom 1, then multiplied by zoom;
+ * - the model rotates about the center of those bounds;
+ * - x / y move that center as a percent of half the stage size;
+ * - render scale sets the canvas's backing resolution, not the model's size.
+ */
+
+import * as spine from '@esotericsoftware/spine-webgl';
+import type { ModelAssets, ModelBundle } from './assets';
+import {
+  type ModelDescription,
+  type ModelRecord,
+  type ModelSettings,
+  type SpineSettings,
+  SETTINGS_LIMITS,
+} from '../shared/settings';
+
+/** Host UI under the pointer that must keep its clicks even where the model is drawn. */
+const INTERACTIVE_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  'button',
+  'a[href]',
+  'label',
+  'summary',
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="textbox"]',
+  '[role="menuitem"]',
+  '[role="tab"]',
+  '[role="slider"]',
+].join(',');
+
+/** Crossfade between animations on the same track, in seconds. */
+const DEFAULT_MIX = 0.2;
+/** Slots fainter than this don't count as part of the model (bounds and clicks). */
+const MIN_VISIBLE_ALPHA = 0.05;
+/** Longest frame step fed to the animation, so a backgrounded tab doesn't jump. */
+const MAX_DELTA = 0.1;
+/**
+ * Most canvas pixels drawn at once (4096²). Browsers cap the drawing buffer's
+ * area anyway, and a huge buffer can exhaust GPU memory and lose the context.
+ */
+const MAX_CANVAS_PIXELS = 4096 * 4096;
+/** How long to wait for a lost WebGL context to come back before rebuilding the stage. */
+const CONTEXT_RESTORE_WAIT_MS = 3000;
+
+// The canvas is transparent and composited over the app. Additive slots (glows)
+// must not add alpha, or they'd darken the page behind them instead of
+// brightening it: keep the destination's alpha by using ZERO for the source's.
+(spine.PolygonBatcher as unknown as { blendModesGL: Array<{ srcAlpha: number }> }).blendModesGL[
+  spine.BlendMode.Additive
+]!.srcAlpha = 0; // GL_ZERO
+
+export interface StageDeps {
+  getSettings(): SpineSettings;
+  getModelRecord(modelId: string): ModelRecord | undefined;
+  /** Returns (creating if needed) the per-character per-model settings object. */
+  getModelSettings(characterId: string, modelId: string, description: ModelDescription | null): ModelSettings;
+  saveSettingsDebounced(): void;
+  /** The stage changed the model's position or zoom itself (a drag). */
+  layoutChanged(): void;
+  assets: ModelAssets;
+  /** Send a click interaction message into the chat. */
+  sendInteraction(message: string): void;
+  log(message: string): void;
+}
+
+interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface Gl {
+  canvas: HTMLCanvasElement;
+  context: spine.ManagedWebGLRenderingContext;
+  shader: spine.Shader;
+  batcher: spine.PolygonBatcher;
+  renderer: spine.SkeletonRenderer;
+  debugShader: spine.Shader | null;
+  shapes: spine.ShapeRenderer | null;
+  debugRenderer: spine.SkeletonDebugRenderer | null;
+  mvp: spine.Matrix4;
+  maxDimension: number;
+  maxTextureSize: number;
+  /** Set while a lost context hasn't been restored yet. */
+  restoreTimer: number | null;
+}
+
+interface LoadedEntry {
+  characterId: string;
+  modelId: string;
+  description: ModelDescription;
+  atlas: spine.TextureAtlas;
+  skeleton: spine.Skeleton;
+  state: spine.AnimationState;
+  /** Visible bounds at frame 0 of the idle animation, in skeleton units. */
+  bounds: Bounds;
+  textures: spine.GLTexture[];
+  talkTimer: number | null;
+}
+
+/** skeleton (x, y) -> host CSS pixels: sx = a*x + c*y + e, sy = b*x + d*y + f */
+interface Affine {
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+  e: number;
+  f: number;
+}
+
+function dirname(path: string): string {
+  const index = path.lastIndexOf('/');
+  return index === -1 ? '' : path.slice(0, index);
+}
+
+function normalizePath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return parts.join('/');
+}
+
+/** A bundle file by path relative to `baseDir`, falling back to a case-insensitive match. */
+function bundleFile(bundle: ModelBundle, baseDir: string, file: string): Blob | undefined {
+  const resolved = normalizePath(baseDir ? `${baseDir}/${file}` : file);
+  const exact = bundle.files.get(resolved);
+  if (exact) return exact;
+  const lower = resolved.toLowerCase();
+  for (const [path, blob] of bundle.files) {
+    if (path.toLowerCase() === lower) return blob;
+  }
+  return undefined;
+}
+
+/** Stand-in texture for parsing a skeleton without a GL context. */
+class NullTexture extends spine.Texture {
+  constructor(width: number, height: number) {
+    super({ width, height } as unknown as HTMLImageElement);
+  }
+  setFilters(): void {}
+  setWraps(): void {}
+  dispose(): void {}
+}
+
+/**
+ * Parse the atlas with stand-in textures: mesh attachments read their page's
+ * size while the skeleton loads. The stage swaps in GL textures afterwards.
+ */
+async function readAtlas(bundle: ModelBundle): Promise<spine.TextureAtlas> {
+  const text = await bundle.files.get(bundle.atlasFile)?.text();
+  if (text === undefined) throw new Error(`Atlas missing from bundle: ${bundle.atlasFile}`);
+  const atlas = new spine.TextureAtlas(text);
+  for (const page of atlas.pages) page.setTexture(new NullTexture(page.width || 1, page.height || 1));
+  return atlas;
+}
+
+async function readSkeletonData(bundle: ModelBundle, atlas: spine.TextureAtlas): Promise<spine.SkeletonData> {
+  const file = bundle.files.get(bundle.skeletonFile);
+  if (!file) throw new Error(`Skeleton missing from bundle: ${bundle.skeletonFile}`);
+  const loader = new spine.AtlasAttachmentLoader(atlas);
+  if (/\.json$/i.test(bundle.skeletonFile)) {
+    return new spine.SkeletonJson(loader).readSkeletonData(await file.text());
+  }
+  return new spine.SkeletonBinary(loader).readSkeletonData(new Uint8Array(await file.arrayBuffer()));
+}
+
+function describeSkeleton(data: spine.SkeletonData, atlas: spine.TextureAtlas, record: ModelRecord): ModelDescription {
+  return {
+    animations: data.animations.map((animation) => ({ name: animation.name, duration: animation.duration })),
+    skins: data.skins.map((skin) => skin.name),
+    pma: atlas.pages.some((page) => page.pma) || record.pma,
+  };
+}
+
+/** Run `visit` with the world-space triangles of every visible region and mesh attachment. */
+function forEachVisibleTriangle(
+  skeleton: spine.Skeleton,
+  visit: (vertices: ArrayLike<number>, triangles: ArrayLike<number>) => boolean | void,
+): void {
+  const vertices: number[] = [];
+  for (const slot of skeleton.drawOrder) {
+    if (!slot.bone.active) continue;
+    const attachment = slot.getAttachment();
+    if (!attachment) continue;
+    let triangles: ArrayLike<number>;
+    if (attachment instanceof spine.RegionAttachment) {
+      if (skeleton.color.a * slot.color.a * attachment.color.a < MIN_VISIBLE_ALPHA) continue;
+      vertices.length = 8;
+      attachment.computeWorldVertices(slot, vertices, 0, 2);
+      triangles = spine.SkeletonRenderer.QUAD_TRIANGLES;
+    } else if (attachment instanceof spine.MeshAttachment) {
+      if (skeleton.color.a * slot.color.a * attachment.color.a < MIN_VISIBLE_ALPHA) continue;
+      vertices.length = attachment.worldVerticesLength;
+      attachment.computeWorldVertices(slot, 0, attachment.worldVerticesLength, vertices, 0, 2);
+      triangles = attachment.triangles;
+    } else {
+      continue;
+    }
+    if (visit(vertices, triangles) === true) return;
+  }
+}
+
+function visibleBounds(skeleton: spine.Skeleton): Bounds | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  forEachVisibleTriangle(skeleton, (vertices) => {
+    for (let i = 0; i + 1 < vertices.length; i += 2) {
+      const x = vertices[i]!;
+      const y = vertices[i + 1]!;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  });
+  if (!Number.isFinite(minX) || maxX - minX <= 0 || maxY - minY <= 0) return null;
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+/** Give an atlas page without a `size:` line its image's size, and recompute its regions' UVs. */
+function setPageSize(page: spine.TextureAtlasPage, width: number, height: number): void {
+  page.width = width;
+  page.height = height;
+  for (const region of page.regions) {
+    region.u = region.x / width;
+    region.v = region.y / height;
+    if (region.degrees === 90) {
+      region.u2 = (region.x + region.height) / width;
+      region.v2 = (region.y + region.width) / height;
+    } else {
+      region.u2 = (region.x + region.width) / width;
+      region.v2 = (region.y + region.height) / height;
+    }
+  }
+  // Mesh attachments read the page's size from its texture while the skeleton loads.
+  if (page.texture instanceof NullTexture) page.setTexture(new NullTexture(width, height));
+}
+
+/**
+ * Visible bounds at frame 0 of the idle animation (or the setup pose without
+ * one), with the configured skin. Measured on a scratch skeleton so the one on
+ * stage keeps its pose.
+ */
+function measureReferenceBounds(data: spine.SkeletonData, settings: ModelSettings): Bounds {
+  const skeleton = new spine.Skeleton(data);
+  const skin = (settings.skin && data.findSkin(settings.skin)) || data.defaultSkin;
+  if (skin) skeleton.setSkin(skin);
+  skeleton.setToSetupPose();
+  const idle = settings.animation_idle !== 'none' ? data.findAnimation(settings.animation_idle) : null;
+  if (idle) idle.apply(skeleton, 0, 0, false, [], 1, spine.MixBlend.setup, spine.MixDirection.mixIn);
+  skeleton.updateWorldTransform();
+  const bounds = visibleBounds(skeleton);
+  if (bounds) return bounds;
+  if (data.width > 0 && data.height > 0) return { x: data.x, y: data.y, width: data.width, height: data.height };
+  return { x: -50, y: 0, width: 100, height: 100 };
+}
+
+function pointInTriangle(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  cx: number,
+  cy: number,
+): boolean {
+  const d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+  const d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+  const d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+  const hasNegative = d1 < 0 || d2 < 0 || d3 < 0;
+  const hasPositive = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(hasNegative && hasPositive);
+}
+
+export class Stage {
+  private host: HTMLElement | null = null;
+  private gl: Gl | null = null;
+  private loaded: LoadedEntry | null = null;
+  private chatId: string | null = null;
+  private characterId: string | null = null;
+  private loadToken = 0;
+  private frameRequest: number | null = null;
+  private lastFrameTime = 0;
+  private hostWidth = 0;
+  private hostHeight = 0;
+  private resizeObserver: ResizeObserver | null = null;
+  private starterTimer: number | null = null;
+  private previousInteraction = { characterId: '', message: '' };
+  private descriptionCache = new Map<string, ModelDescription>();
+  private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
+    null;
+  private suppressClick = false;
+  private hoverFrame: number | null = null;
+  private hovering = false;
+
+  // The canvas never takes pointer events, so it can't block the chat UI drawn
+  // under it. Model interaction is detected at the document level instead.
+  private listeners: Array<[EventTarget, string, EventListener, AddEventListenerOptions]> = [
+    [document, 'pointerdown', (event) => this.onPointerDown(event as PointerEvent), { capture: true }],
+    [document, 'pointermove', (event) => this.onPointerMove(event as PointerEvent), { capture: true }],
+    [document, 'pointerup', (event) => this.onPointerUp(event as PointerEvent), { capture: true }],
+    [document, 'pointercancel', () => this.endDrag(), { capture: true }],
+    [document, 'click', (event) => this.onClickCapture(event as MouseEvent), { capture: true }],
+    [document, 'touchstart', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
+    [document, 'touchmove', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
+  ];
+
+  constructor(private deps: StageDeps) {
+    for (const [target, type, listener, options] of this.listeners) target.addEventListener(type, listener, options);
+  }
+
+  destroy(): void {
+    for (const [target, type, listener, options] of this.listeners) {
+      target.removeEventListener(type, listener, options);
+    }
+    if (this.hoverFrame !== null) window.cancelAnimationFrame(this.hoverFrame);
+    this.hoverFrame = null;
+    this.setHovering(false);
+    this.teardown();
+  }
+
+  /** Attach the stage to a host element (overlay mount root or embedded panel). */
+  setHost(host: HTMLElement | null): void {
+    if (this.host === host) return;
+    this.teardown();
+    this.host = host;
+    void this.reload();
+  }
+
+  setChatContext(chatId: string | null, characterId: string | null): void {
+    const changed = chatId !== this.chatId || characterId !== this.characterId;
+    this.chatId = chatId;
+    this.characterId = characterId;
+    if (changed) void this.reload();
+  }
+
+  getChatContext(): { chatId: string | null; characterId: string | null } {
+    return { chatId: this.chatId, characterId: this.characterId };
+  }
+
+  currentModel(): { characterId: string; modelId: string } | null {
+    return this.loaded ? { characterId: this.loaded.characterId, modelId: this.loaded.modelId } : null;
+  }
+
+  getDescription(): ModelDescription | null {
+    return this.loaded?.description ?? null;
+  }
+
+  /** Rebuild the whole stage from current settings + chat context. */
+  async reload(): Promise<void> {
+    this.teardown(); // bumps loadToken, cancelling any in-flight load
+    const token = this.loadToken;
+
+    const settings = this.deps.getSettings();
+    if (!settings.global.enabled || !this.host || !this.characterId) return;
+    const modelId = settings.characterModelMapping[this.characterId];
+    if (!modelId) return;
+    const record = this.deps.getModelRecord(modelId);
+    if (!record) return;
+
+    let bundle: ModelBundle;
+    try {
+      bundle = await this.deps.assets.load(record);
+    } catch (error) {
+      this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
+      return;
+    }
+    if (token !== this.loadToken || !this.host) return;
+
+    try {
+      await this.loadModel(record, bundle, token);
+    } catch (error) {
+      if (token === this.loadToken) {
+        this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
+        this.teardown();
+      }
+    }
+  }
+
+  private createGl(host: HTMLElement): Gl {
+    const canvas = document.createElement('canvas');
+    canvas.className = 'spine-avatars-canvas';
+    host.appendChild(canvas);
+    try {
+      const context = new spine.ManagedWebGLRenderingContext(canvas, {
+        alpha: true,
+        premultipliedAlpha: true,
+        antialias: true,
+        preserveDrawingBuffer: false,
+      });
+      if (!context.gl) throw new Error('WebGL is unavailable in this browser.');
+      const gl = context.gl;
+      const maxViewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array | null;
+      const maxRenderbuffer = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number;
+      const result: Gl = {
+        canvas,
+        context,
+        shader: spine.Shader.newTwoColoredTextured(context),
+        batcher: new spine.PolygonBatcher(context, true),
+        renderer: new spine.SkeletonRenderer(context, true),
+        debugShader: null,
+        shapes: null,
+        debugRenderer: null,
+        mvp: new spine.Matrix4(),
+        maxDimension: Math.max(256, Math.min(maxRenderbuffer || 4096, maxViewport?.[0] ?? 4096, 8192)),
+        maxTextureSize: (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096,
+        restoreTimer: null,
+      };
+      // spine-webgl restores shaders, buffers and textures when the context comes
+      // back. A context that never comes back (the browser evicted it, or ran out
+      // of GPU memory) leaves a blank stage, so rebuild it after a while.
+      canvas.addEventListener('webglcontextlost', () => {
+        if (this.gl !== result || result.restoreTimer !== null) return;
+        result.restoreTimer = window.setTimeout(() => {
+          result.restoreTimer = null;
+          if (this.gl !== result) return;
+          this.deps.log('WebGL context was lost and not restored; reloading the model.');
+          void this.reload();
+        }, CONTEXT_RESTORE_WAIT_MS);
+      });
+      canvas.addEventListener('webglcontextrestored', () => {
+        if (result.restoreTimer !== null) window.clearTimeout(result.restoreTimer);
+        result.restoreTimer = null;
+        // GLTexture.restore() resets filters and wraps to defaults; re-apply the atlas's.
+        const entry = this.loaded;
+        if (this.gl === result && entry) {
+          entry.atlas.pages.forEach((page, index) => {
+            const texture = entry.textures[index];
+            if (texture) page.setTexture(texture);
+          });
+        }
+      });
+      return result;
+    } catch (error) {
+      canvas.remove();
+      throw error;
+    }
+  }
+
+  private async loadModel(record: ModelRecord, bundle: ModelBundle, token: number): Promise<void> {
+    const characterId = this.characterId!;
+    const host = this.host!;
+    const atlas = await readAtlas(bundle);
+
+    // Decode every atlas page before touching GL, so a cancelled load leaves nothing behind.
+    const atlasDir = dirname(bundle.atlasFile);
+    const images: ImageBitmap[] = [];
+    const closeImages = () => images.forEach((image) => image.close());
+    const cancelled = () => token !== this.loadToken || this.host !== host;
+    let data: spine.SkeletonData;
+    try {
+      for (const page of atlas.pages) {
+        const blob = bundleFile(bundle, atlasDir, page.name);
+        if (!blob) throw new Error(`Atlas page image missing: ${page.name}`);
+        // Upload the stored bytes as they are: premultiplication is the
+        // premultiplied-alpha setting's job, not the decoder's.
+        const image = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+        images.push(image);
+        if (!page.width || !page.height) setPageSize(page, image.width, image.height);
+      }
+      if (cancelled()) return closeImages();
+      data = await readSkeletonData(bundle, atlas);
+    } catch (error) {
+      closeImages();
+      throw error;
+    }
+    if (cancelled()) return closeImages();
+
+    const description = describeSkeleton(data, atlas, record);
+    this.descriptionCache.set(`${record.id}@${record.version}`, description);
+    const modelSettings = this.deps.getModelSettings(characterId, record.id, description);
+
+    let gl: Gl;
+    try {
+      gl = this.createGl(host);
+    } catch (error) {
+      closeImages();
+      throw error;
+    }
+    this.gl = gl;
+    const textures: spine.GLTexture[] = [];
+    try {
+      atlas.pages.forEach((page, index) => {
+        const image = images[index]!;
+        if (Math.max(image.width, image.height) > gl.maxTextureSize) {
+          this.deps.log(
+            `Atlas page ${page.name} is ${image.width}x${image.height}, larger than this GPU's ` +
+              `${gl.maxTextureSize}px texture limit; it may draw black.`,
+          );
+        }
+        const texture = new spine.GLTexture(gl.context, image);
+        textures.push(texture);
+        page.setTexture(texture);
+      });
+    } catch (error) {
+      // Not yet owned by an entry, so teardown can't free these.
+      textures.forEach((texture) => texture.dispose());
+      closeImages();
+      throw error;
+    }
+
+    const skeleton = new spine.Skeleton(data);
+    const stateData = new spine.AnimationStateData(data);
+    stateData.defaultMix = DEFAULT_MIX;
+    const entry: LoadedEntry = {
+      characterId,
+      modelId: record.id,
+      description,
+      atlas,
+      skeleton,
+      state: new spine.AnimationState(stateData),
+      bounds: { x: 0, y: 0, width: 1, height: 1 },
+      textures,
+      talkTimer: null,
+    };
+    // Owned by the stage from here on, so teardown frees it on any later failure.
+    this.loaded = entry;
+    this.applySkinTo(entry, modelSettings);
+    this.startIdle(entry, modelSettings);
+    entry.bounds = measureReferenceBounds(data, modelSettings);
+
+    this.observeSize(gl.canvas);
+    this.lastFrameTime = performance.now();
+    this.frameRequest = window.requestAnimationFrame(this.frame);
+
+    const starter = modelSettings.animation_starter;
+    if (starter.animation !== 'none') {
+      this.starterTimer = window.setTimeout(() => {
+        this.starterTimer = null;
+        if (this.loaded === entry) this.playAnimation(starter.animation);
+      }, Math.max(0, starter.delay));
+    }
+  }
+
+  /** Track the canvas's CSS size: the area drawn into and hit-tested. */
+  private observeSize(canvas: HTMLCanvasElement): void {
+    const measure = () => {
+      this.hostWidth = canvas.clientWidth;
+      this.hostHeight = canvas.clientHeight;
+    };
+    measure();
+    if (this.hostWidth === 0 || this.hostHeight === 0) {
+      this.deps.log(`Stage host has no size yet (${this.hostWidth}x${this.hostHeight}); waiting for it to be shown.`);
+    }
+    this.resizeObserver = new ResizeObserver(measure);
+    this.resizeObserver.observe(canvas);
+  }
+
+  /** Look up a per-model settings object without creating or reshaping it. */
+  private settingsFor(entry: LoadedEntry): ModelSettings {
+    const stored = this.deps.getSettings().characterModelsSettings[entry.characterId]?.[entry.modelId];
+    return stored ?? this.deps.getModelSettings(entry.characterId, entry.modelId, entry.description);
+  }
+
+  // ── Render loop ───────────────────────────────────────────────────────────
+
+  private frame = (now: number): void => {
+    this.frameRequest = null;
+    const entry = this.loaded;
+    const gl = this.gl;
+    if (!entry || !gl) return;
+    this.frameRequest = window.requestAnimationFrame(this.frame);
+
+    const delta = Math.min(MAX_DELTA, Math.max(0, (now - this.lastFrameTime) / 1000));
+    this.lastFrameTime = now;
+    const settings = this.settingsFor(entry);
+    const step = delta * settings.speed;
+    entry.state.update(step);
+    entry.state.apply(entry.skeleton);
+    entry.skeleton.updateWorldTransform();
+
+    const width = this.hostWidth;
+    const height = this.hostHeight;
+    if (width === 0 || height === 0 || gl.context.gl.isContextLost()) return;
+    this.resizeCanvas(gl, width, height, settings.renderScale);
+    this.draw(gl, entry, settings, width, height);
+  };
+
+  private resizeCanvas(gl: Gl, width: number, height: number, renderScale: number): void {
+    const density = (window.devicePixelRatio || 1) * renderScale;
+    let pixelWidth = Math.max(1, Math.round(width * density));
+    let pixelHeight = Math.max(1, Math.round(height * density));
+    const shrink = Math.min(
+      1,
+      gl.maxDimension / Math.max(pixelWidth, pixelHeight),
+      Math.sqrt(MAX_CANVAS_PIXELS / (pixelWidth * pixelHeight)),
+    );
+    if (shrink < 1) {
+      pixelWidth = Math.max(1, Math.floor(pixelWidth * shrink));
+      pixelHeight = Math.max(1, Math.floor(pixelHeight * shrink));
+    }
+    if (gl.canvas.width !== pixelWidth) gl.canvas.width = pixelWidth;
+    if (gl.canvas.height !== pixelHeight) gl.canvas.height = pixelHeight;
+  }
+
+  private draw(gl: Gl, entry: LoadedEntry, settings: ModelSettings, width: number, height: number): void {
+    const context = gl.context.gl;
+    // The browser may give the canvas a smaller buffer than asked for; draw into what it has.
+    context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
+    context.clearColor(0, 0, 0, 0);
+    context.clear(context.COLOR_BUFFER_BIT);
+
+    const t = this.transform(entry, settings, width, height);
+    // Host CSS pixels -> clip space, folded into the skeleton transform.
+    const m = gl.mvp.values;
+    m.fill(0);
+    m[spine.M00] = (2 * t.a) / width;
+    m[spine.M01] = (2 * t.c) / width;
+    m[spine.M03] = (2 * t.e) / width - 1;
+    m[spine.M10] = (-2 * t.b) / height;
+    m[spine.M11] = (-2 * t.d) / height;
+    m[spine.M13] = 1 - (2 * t.f) / height;
+    m[spine.M22] = 1;
+    m[spine.M33] = 1;
+
+    gl.shader.bind();
+    gl.shader.setUniformi(spine.Shader.SAMPLER, 0);
+    gl.shader.setUniform4x4f(spine.Shader.MVP_MATRIX, m);
+    gl.renderer.premultipliedAlpha = settings.premultipliedAlpha;
+    gl.batcher.begin(gl.shader);
+    gl.renderer.draw(gl.batcher, entry.skeleton);
+    gl.batcher.end();
+    gl.shader.unbind();
+
+    if (this.deps.getSettings().global.showBounds) this.drawDebug(gl, entry, m);
+  }
+
+  private drawDebug(gl: Gl, entry: LoadedEntry, mvp: Float32Array): void {
+    if (!gl.debugShader) {
+      gl.debugShader = spine.Shader.newColored(gl.context);
+      gl.shapes = new spine.ShapeRenderer(gl.context);
+      gl.debugRenderer = new spine.SkeletonDebugRenderer(gl.context);
+      gl.debugRenderer.drawMeshTriangles = false;
+    }
+    const shader = gl.debugShader;
+    const shapes = gl.shapes!;
+    shader.bind();
+    shader.setUniform4x4f(spine.Shader.MVP_MATRIX, mvp);
+    shapes.begin(shader);
+    gl.debugRenderer!.draw(shapes, entry.skeleton);
+    const { x, y, width, height } = entry.bounds;
+    shapes.setColor(new spine.Color(1, 0.6, 0, 1));
+    shapes.rect(false, x, y, width, height);
+    shapes.end();
+    shader.unbind();
+  }
+
+  // ── Layout ────────────────────────────────────────────────────────────────
+
+  /** The skeleton -> host-pixel transform for the current settings and stage size. */
+  private transform(entry: LoadedEntry, settings: ModelSettings, width: number, height: number): Affine {
+    const bounds = entry.bounds;
+    const fit = Math.min(width / bounds.width, height / bounds.height);
+    const scale = fit * settings.zoom;
+    const angle = (settings.rotation * Math.PI) / 180;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const centerX = bounds.x + bounds.width / 2;
+    const centerY = bounds.y + bounds.height / 2;
+    const targetX = width / 2 + ((width / 2) * settings.x) / 100;
+    const targetY = height / 2 + ((height / 2) * settings.y) / 100;
+    // Skeleton space is y-up and the screen is y-down; rotation is clockwise on screen.
+    const a = scale * cos;
+    const c = scale * sin;
+    const b = scale * sin;
+    const d = -scale * cos;
+    return { a, b, c, d, e: targetX - a * centerX - c * centerY, f: targetY - b * centerX - d * centerY };
+  }
+
+  private toSkeletonPoint(entry: LoadedEntry, x: number, y: number): { x: number; y: number } {
+    const t = this.transform(entry, this.settingsFor(entry), this.hostWidth, this.hostHeight);
+    const det = t.a * t.d - t.b * t.c;
+    if (det === 0) return { x: NaN, y: NaN };
+    const u = x - t.e;
+    const v = y - t.f;
+    return { x: (t.d * u - t.c * v) / det, y: (-t.b * u + t.a * v) / det };
+  }
+
+  /**
+   * Zoom so the whole model fits the stage at its current rotation, and center it.
+   * Returns false when no model is on stage.
+   */
+  fitToCanvas(characterId: string, modelId: string): boolean {
+    const entry = this.loaded;
+    if (!entry || entry.characterId !== characterId || entry.modelId !== modelId) return false;
+    const width = this.hostWidth;
+    const height = this.hostHeight;
+    if (width === 0 || height === 0) return false;
+    const settings = this.settingsFor(entry);
+    const { width: boundsWidth, height: boundsHeight } = entry.bounds;
+    const angle = (settings.rotation * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(angle));
+    const sin = Math.abs(Math.sin(angle));
+    const rotatedWidth = cos * boundsWidth + sin * boundsHeight;
+    const rotatedHeight = sin * boundsWidth + cos * boundsHeight;
+    const fitRotated = Math.min(width / rotatedWidth, height / rotatedHeight);
+    const fitUpright = Math.min(width / boundsWidth, height / boundsHeight);
+    const { min, max } = SETTINGS_LIMITS.zoom;
+    // Round down so the fitted model never overflows the stage.
+    settings.zoom = Math.min(max, Math.max(min, Math.floor((fitRotated / fitUpright) * 100) / 100));
+    settings.x = 0;
+    settings.y = 0;
+    this.deps.saveSettingsDebounced();
+    return true;
+  }
+
+  // ── Skin and animation ────────────────────────────────────────────────────
+
+  private findAnimation(entry: LoadedEntry, name: string): spine.Animation | null {
+    if (!name || name === 'none') return null;
+    return entry.skeleton.data.findAnimation(name);
+  }
+
+  private applySkinTo(entry: LoadedEntry, settings: ModelSettings): void {
+    const { skeleton } = entry;
+    const skin = (settings.skin && skeleton.data.findSkin(settings.skin)) || skeleton.data.defaultSkin;
+    if (skin) skeleton.setSkin(skin);
+    skeleton.setSlotsToSetupPose();
+  }
+
+  private startIdle(entry: LoadedEntry, settings: ModelSettings): void {
+    const idle = this.findAnimation(entry, settings.animation_idle);
+    if (idle) entry.state.setAnimation(0, idle.name, true);
+    else entry.state.setEmptyAnimation(0, DEFAULT_MIX);
+  }
+
+  /** Re-apply the skin after the setting changes. The reference bounds follow it, as on the next load. */
+  applySkin(): void {
+    const entry = this.loaded;
+    if (!entry) return;
+    const settings = this.settingsFor(entry);
+    this.applySkinTo(entry, settings);
+    entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
+  }
+
+  /** Switch to the idle animation after the setting changes. The reference bounds follow it, as on the next load. */
+  applyIdle(): void {
+    const entry = this.loaded;
+    if (!entry) return;
+    const settings = this.settingsFor(entry);
+    this.startIdle(entry, settings);
+    entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
+  }
+
+  /** Play an animation once on the base track, then go back to idling. */
+  playAnimation(name: string): void {
+    const entry = this.loaded;
+    if (!entry) return;
+    const animation = this.findAnimation(entry, name);
+    if (!animation) return;
+    entry.state.setAnimation(0, animation.name, false);
+    const idle = this.findAnimation(entry, this.settingsFor(entry).animation_idle);
+    if (idle) entry.state.addAnimation(0, idle.name, true, 0);
+    else entry.state.addEmptyAnimation(0, DEFAULT_MIX, 0);
+  }
+
+  /** Loop the talk animation on its own track for a time based on the message length. */
+  playTalk(textLength: number): void {
+    const entry = this.loaded;
+    if (!entry || textLength <= 0) return;
+    const settings = this.settingsFor(entry);
+    const talk = this.findAnimation(entry, settings.animation_talk);
+    if (!talk) return;
+    if (entry.talkTimer !== null) window.clearTimeout(entry.talkTimer);
+    const current = entry.state.getCurrent(1);
+    if (current?.animation?.name !== talk.name) {
+      // Fade in from nothing instead of popping to full strength.
+      if (!current) entry.state.setEmptyAnimation(1, 0);
+      entry.state.addAnimation(1, talk.name, true, 0).mixDuration = DEFAULT_MIX;
+    }
+    const speed = Math.max(0.05, settings.speed);
+    const duration = (textLength * settings.talk_time_per_character) / speed;
+    entry.talkTimer = window.setTimeout(() => {
+      entry.talkTimer = null;
+      if (this.loaded === entry) entry.state.setEmptyAnimation(1, DEFAULT_MIX);
+    }, duration);
+  }
+
+  // ── Descriptions ──────────────────────────────────────────────────────────
+
+  /** Read a model's animations and skins (downloading its files if needed). */
+  async describeModel(record: ModelRecord): Promise<ModelDescription> {
+    const key = `${record.id}@${record.version}`;
+    const cached = this.descriptionCache.get(key);
+    if (cached) return cached;
+    const bundle = await this.deps.assets.load(record);
+    const atlas = await readAtlas(bundle);
+    const data = await readSkeletonData(bundle, atlas);
+    const description = describeSkeleton(data, atlas, record);
+    this.descriptionCache.set(key, description);
+    return description;
+  }
+
+  // ── Interaction ───────────────────────────────────────────────────────────
+
+  /**
+   * Whether a pointer event at this position belongs to the model: the model's
+   * canvas must be the topmost layer there (no drawer or modal above it), the
+   * element underneath must not be a control (input, button, link…), and the
+   * point must fall on one of the model's visible drawn parts.
+   */
+  private isModelInteraction(event: PointerEvent): boolean {
+    const entry = this.loaded;
+    const canvas = this.gl?.canvas;
+    if (!entry || !canvas) return false;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest(INTERACTIVE_SELECTOR)) return false;
+
+    const previous = canvas.style.pointerEvents;
+    canvas.style.pointerEvents = 'auto';
+    const topmost = document.elementFromPoint(event.clientX, event.clientY);
+    canvas.style.pointerEvents = previous;
+    if (topmost !== canvas) return false;
+
+    const point = this.toStagePoint(event);
+    return this.isOverModel(entry, point.x, point.y);
+  }
+
+  private isOverModel(entry: LoadedEntry, stageX: number, stageY: number): boolean {
+    const point = this.toSkeletonPoint(entry, stageX, stageY);
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return false;
+    let hit = false;
+    try {
+      forEachVisibleTriangle(entry.skeleton, (vertices, triangles) => {
+        for (let i = 0; i + 2 < triangles.length; i += 3) {
+          const p = triangles[i]! * 2;
+          const q = triangles[i + 1]! * 2;
+          const r = triangles[i + 2]! * 2;
+          if (
+            pointInTriangle(
+              point.x,
+              point.y,
+              vertices[p]!,
+              vertices[p + 1]!,
+              vertices[q]!,
+              vertices[q + 1]!,
+              vertices[r]!,
+              vertices[r + 1]!,
+            )
+          ) {
+            hit = true;
+            return true;
+          }
+        }
+        return false;
+      });
+    } catch {
+      /* model torn down mid-check */
+    }
+    return hit;
+  }
+
+  /** The model's center in host pixels. */
+  private modelCenter(entry: LoadedEntry): { x: number; y: number } {
+    const settings = this.settingsFor(entry);
+    return {
+      x: this.hostWidth / 2 + ((this.hostWidth / 2) * settings.x) / 100,
+      y: this.hostHeight / 2 + ((this.hostHeight / 2) * settings.y) / 100,
+    };
+  }
+
+  private onPointerDown(event: PointerEvent): void {
+    if (event.button !== 0 || !this.isModelInteraction(event)) return;
+    const entry = this.loaded!;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = this.toStagePoint(event);
+    const center = this.modelCenter(entry);
+    this.drag = {
+      entry,
+      pointerId: event.pointerId,
+      offsetX: point.x - center.x,
+      offsetY: point.y - center.y,
+      moved: false,
+    };
+    this.suppressClick = true;
+  }
+
+  private onPointerMove(event: PointerEvent): void {
+    const drag = this.drag;
+    if (drag && event.pointerId === drag.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.dragTo(drag, event);
+      return;
+    }
+    if (!this.loaded) return;
+    if (event.pointerType === 'mouse' && this.hoverFrame === null) {
+      this.hoverFrame = window.requestAnimationFrame(() => {
+        this.hoverFrame = null;
+        this.setHovering(this.isModelInteraction(event));
+      });
+    }
+  }
+
+  private dragTo(drag: NonNullable<Stage['drag']>, event: PointerEvent): void {
+    const { entry } = drag;
+    if (this.loaded !== entry || this.hostWidth === 0 || this.hostHeight === 0) return;
+    const point = this.toStagePoint(event);
+    const center = this.modelCenter(entry);
+    const newX = point.x - drag.offsetX;
+    const newY = point.y - drag.offsetY;
+    if (!drag.moved && Math.abs(newX - center.x) < 3 && Math.abs(newY - center.y) < 3) return;
+    drag.moved = true;
+    // Persist as percent offsets of the model's center from the stage center.
+    const settings = this.settingsFor(entry);
+    const { min, max } = SETTINGS_LIMITS.offset;
+    const percent = (value: number) => Math.min(max, Math.max(min, Math.round(value * 100) / 100));
+    settings.x = percent(((newX - this.hostWidth / 2) / (this.hostWidth / 2)) * 100);
+    settings.y = percent(((newY - this.hostHeight / 2) / (this.hostHeight / 2)) * 100);
+    this.deps.saveSettingsDebounced();
+    this.deps.layoutChanged();
+  }
+
+  private onPointerUp(event: PointerEvent): void {
+    const drag = this.drag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.endDrag();
+    if (!drag.moved && this.loaded === drag.entry) this.onModelClick(drag.entry);
+  }
+
+  private endDrag(): void {
+    this.drag = null;
+    // The browser dispatches `click` right after `pointerup`; if the pointer was
+    // released over a different element no click comes, so stop suppressing.
+    window.setTimeout(() => {
+      this.suppressClick = false;
+    }, 0);
+  }
+
+  private onClickCapture(event: MouseEvent): void {
+    if (!this.suppressClick) return;
+    this.suppressClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  private setHovering(hovering: boolean): void {
+    if (hovering === this.hovering) return;
+    this.hovering = hovering;
+    document.documentElement.classList.toggle('spine-avatars-hover', hovering);
+  }
+
+  private toStagePoint(event: PointerEvent): { x: number; y: number } {
+    const rect = this.gl?.canvas.getBoundingClientRect();
+    return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
+  }
+
+  private onModelClick(entry: LoadedEntry): void {
+    const click = this.settingsFor(entry).animation_click;
+    if (click.message) {
+      if (
+        this.previousInteraction.characterId === entry.characterId &&
+        this.previousInteraction.message === click.message
+      ) {
+        this.deps.log('Same as last interaction, message not sent again.');
+      } else {
+        this.previousInteraction = { characterId: entry.characterId, message: click.message };
+        this.deps.sendInteraction(click.message);
+      }
+    }
+    if (click.animation !== 'none') this.playAnimation(click.animation);
+  }
+
+  // ── Teardown ──────────────────────────────────────────────────────────────
+
+  private teardown(): void {
+    this.loadToken++;
+    // A press that started on the model won't get its pointerup handled now,
+    // so don't leave the next click anywhere swallowed.
+    if (this.drag) this.suppressClick = false;
+    this.drag = null;
+    this.setHovering(false);
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    if (this.frameRequest !== null) {
+      window.cancelAnimationFrame(this.frameRequest);
+      this.frameRequest = null;
+    }
+    if (this.starterTimer !== null) {
+      window.clearTimeout(this.starterTimer);
+      this.starterTimer = null;
+    }
+    const entry = this.loaded;
+    this.loaded = null;
+    if (entry) {
+      if (entry.talkTimer !== null) window.clearTimeout(entry.talkTimer);
+      for (const texture of entry.textures) {
+        try {
+          texture.dispose();
+        } catch {
+          /* context already lost */
+        }
+        (texture.getImage() as ImageBitmap | null)?.close?.();
+      }
+    }
+    const gl = this.gl;
+    this.gl = null;
+    if (gl) {
+      if (gl.restoreTimer !== null) window.clearTimeout(gl.restoreTimer);
+      for (const disposable of [gl.batcher, gl.shader, gl.debugShader, gl.shapes]) {
+        try {
+          disposable?.dispose();
+        } catch {
+          /* context already lost */
+        }
+      }
+      // Free the GPU context now instead of whenever the canvas is collected;
+      // browsers cap how many live WebGL contexts a page may hold.
+      try {
+        gl.context.gl.getExtension('WEBGL_lose_context')?.loseContext();
+      } catch {
+        /* unsupported */
+      }
+      gl.canvas.remove();
+    }
+  }
+}
