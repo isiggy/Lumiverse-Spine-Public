@@ -17,9 +17,10 @@ The Spine runtime is the npm package `@esotericsoftware/spine-webgl`, pinned to 
 
 `Stage.transform()` maps skeleton coordinates (y-up) to host CSS pixels; the render loop folds that into the MVP matrix each frame, and pointer hit-testing uses its inverse. Settings are read every frame, so the UI only has to mutate the settings object.
 
-- Reference bounds: the visible parts at frame 0 of the idle animation, measured once per load. Zoom 1 fits these bounds to the stage, upright.
-- Rotation is about the center of those bounds. X/Y move that center by a percent of half the stage size.
-- Render scale only sets the canvas's backing size (`devicePixelRatio × renderScale`, clamped to the GPU's limits).
+- Group chats: every chat member with a bound model is drawn on one shared canvas. The stage is split into equal columns, one per model, in member order, and everything below is relative to the model's column instead of the whole stage (a solo chat has one column). The backend reads the members from `chat.metadata.character_ids` (`metadata.group === true`) and sends them as `chat_context` / `chat_members`.
+- Reference bounds: the visible parts at frame 0 of the idle animation, measured once per load. Zoom 1 fits these bounds to the column, upright.
+- Rotation is about the center of those bounds. X/Y move that center by a percent of half the column's size.
+- Render scale only sets the canvas's backing size (`devicePixelRatio × renderScale`, clamped to the GPU's limits); with several models the highest render scale wins.
 - Premultiplied alpha: atlas pages are decoded with `premultiplyAlpha: 'none'` so the stored bytes reach the GPU untouched, and the toggle sets `SkeletonRenderer.premultipliedAlpha`. The default comes from the atlas's `pma:` line.
 
 ## Build
@@ -45,6 +46,7 @@ scripts/dev/lumiverse.sh e2e      # headless: create a chat, import and bind spi
 `e2e` prints `OK: avatar overlay is on screen` and writes screenshots to `$LUMI_WORK/shots/`. It reads the canvas back, so an overlay that's present but empty fails. After changing code, run `deploy` then `e2e` again.
 
 - `e2e --model path/to/model.zip` tests a specific model instead of spineboy. The extension names an imported model after its zip file, so `e2e` finds it by that name and imports it only if it isn't in the library yet.
+- `e2e --group` tests a three-member group chat (`seed-group` creates it): each member's model in its own column, a drag and a talking message reaching only the right model, and the stage re-laying out when a member leaves and comes back. Repeat `--model` to give members different models in turn.
 - `e2e --controls` then drives every control in the Model settings tab (fit, zoom, rotation, fit while rotated, center, render scale, playback speed, premultiplied alpha, persistence across a reload), checks each one's effect on the drawn model, and saves a `control-*.png` screenshot for each.
 - `e2e --slow` sends the browser's traffic through a 3 MB/s proxy (`scripts/dev/throttle-proxy.mjs`), like a remote user. Use it for anything that touches model downloads.
 
@@ -73,3 +75,5 @@ Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and c
 ## Reference
 
 docs.lumiverse.chat is blocked by the network proxy. The same docs are in the Lumiverse repo under `developer-docs/docs/`, at `$LUMI_WORK/Lumiverse` after `setup`. The Spine 4.1 runtime source is in `node_modules/@esotericsoftware/spine-core` and `spine-webgl` (`dist/*.js` are readable ES modules).
+
+- Messages: Lumiverse documents a `CHARACTER_MESSAGE_RENDERED` event but never emits it. A reply's message is created once it has finished streaming (`MESSAGE_SENT`) and a regenerated reply arrives as `MESSAGE_SWIPED` with `action: 'added'`. In a group chat the message's `extra.character_id` names the member who wrote it (`extra.greeting_character_id` for greetings).

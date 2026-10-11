@@ -5,11 +5,14 @@
 #   scripts/dev/lumiverse.sh start    # start the server in the background, wait until it answers
 #   scripts/dev/lumiverse.sh deploy   # build this extension, install/update it, grant permissions, enable
 #   scripts/dev/lumiverse.sh seed     # create a "Spine Test" character + chat, print the chat URL
+#   scripts/dev/lumiverse.sh seed-group  # create a group chat of three "Spine Test" characters
 #   scripts/dev/lumiverse.sh models   # download the spineboy (Spine 4.1) test model zip
 #   scripts/dev/lumiverse.sh e2e      # headless browser: log in, import + bind spineboy, open the chat, screenshot
 #        [--model path.zip]           #   test this model instead of spineboy
 #        [--slow]                     #   go through a 3 MB/s proxy, like a remote browser
 #        [--controls]                 #   also drive every model control and screenshot each one
+#        [--group]                    #   test a three-member group chat instead; --model can be
+#                                     #   repeated, members get the models in turn
 #   scripts/dev/lumiverse.sh stop | status | logs
 #
 # Everything lives under $LUMI_WORK (default: ${TMPDIR:-/tmp}/lumiverse-dev). In a
@@ -218,6 +221,36 @@ cmd_seed() {
   log "Chat: $BASE/chat/$chat_id"
 }
 
+# A group chat of "Spine Test", "Spine Test 2" and "Spine Test 3".
+cmd_seed_group() {
+  [[ -f "$WORK/chat-id" ]] || cmd_seed
+  login
+  local ids=() name id chat_id
+  for name in "Spine Test" "Spine Test 2" "Spine Test 3"; do
+    id="$(api GET '/api/v1/characters?limit=200' | json "const c=(d.data??d).find(x=>x.name==='$name'); console.log(c?c.id:'')")"
+    if [[ -z "$id" ]]; then
+      id="$(api POST /api/v1/characters "{\"name\":\"$name\",\"description\":\"Spine test character\",\"first_mes\":\"Hello from $name!\"}" | json 'console.log(d.id)')"
+      log "Created character $name ($id)"
+    fi
+    ids+=("$id")
+  done
+  local members
+  members="$(printf '"%s",' "${ids[@]}")"
+  members="[${members%,}]"
+  # Reuse the group chat from last time while it still has these members.
+  chat_id="$(cat "$WORK/group-chat-id" 2>/dev/null || true)"
+  if [[ -n "$chat_id" ]]; then
+    chat_id="$(api GET "/api/v1/chats/$chat_id" | json "console.log(JSON.stringify(d.metadata?.character_ids)===JSON.stringify($members) ? d.id : '')" 2>/dev/null || true)"
+  fi
+  if [[ -z "$chat_id" ]]; then
+    chat_id="$(api POST /api/v1/chats/group "{\"character_ids\":$members,\"name\":\"Spine Group\"}" | json 'console.log(d.id)')"
+    log "Created group chat ($chat_id)"
+  fi
+  echo "$chat_id" >"$WORK/group-chat-id"
+  printf '%s\n' "${ids[@]}" >"$WORK/group-members"
+  log "Group chat: $BASE/chat/$chat_id"
+}
+
 cmd_models() {
   mkdir -p "$WORK/models"
   local zip="$WORK/models/spineboy.zip"
@@ -236,20 +269,23 @@ cmd_models() {
 
 cmd_e2e() {
   is_running || die "Server isn't running; run start first."
-  local model_zip="" slow=false extra=()
+  local model_zips=() slow=false group=false extra=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --model) model_zip="$(realpath "$2")"; shift 2 ;;
+      --model) model_zips+=("$(realpath "$2")"); shift 2 ;;
       --slow) slow=true; shift ;;
+      --group) group=true; extra+=("$1"); shift ;;
       *) extra+=("$1"); shift ;;
     esac
   done
   [[ -f "$WORK/chat-id" ]] || cmd_seed
-  if [[ -z "$model_zip" ]]; then
+  if $group; then cmd_seed_group; fi
+  if [[ ${#model_zips[@]} -eq 0 ]]; then
     [[ -f "$WORK/models/spineboy.zip" ]] || cmd_models
-    model_zip="$WORK/models/spineboy.zip"
+    model_zips=("$WORK/models/spineboy.zip")
   fi
-  [[ -f "$model_zip" ]] || die "No such model zip: $model_zip"
+  local zip
+  for zip in "${model_zips[@]}"; do [[ -f "$zip" ]] || die "No such model zip: $zip"; done
   if [[ ! -d "$WORK/pw/node_modules/playwright" ]]; then
     log "Installing Playwright (uses the preinstalled Chromium)…"
     mkdir -p "$WORK/pw" && (cd "$WORK/pw" && npm init -y >/dev/null && npm install --silent playwright >/dev/null)
@@ -265,7 +301,10 @@ cmd_e2e() {
   fi
   local status=0
   PW_DIR="$WORK/pw" LUMI_BASE="$base" LUMI_USER="$USER_NAME" LUMI_PASS="$USER_PASS" \
-    LUMI_CHAT_ID="$(cat "$WORK/chat-id")" LUMI_MODEL_ZIP="$model_zip" LUMI_OUT="$WORK/shots" \
+    LUMI_CHAT_ID="$(cat "$WORK/chat-id")" LUMI_MODEL_ZIP="${model_zips[0]}" LUMI_OUT="$WORK/shots" \
+    LUMI_MODEL_ZIPS="$(printf '%s\n' "${model_zips[@]}")" \
+    LUMI_GROUP_CHAT_ID="$(cat "$WORK/group-chat-id" 2>/dev/null || true)" \
+    LUMI_GROUP_MEMBERS="$(cat "$WORK/group-members" 2>/dev/null || true)" \
     node "$REPO/scripts/dev/e2e.mjs" "${extra[@]}" || status=$?
   [[ -n "$proxy_pid" ]] && kill "$proxy_pid" 2>/dev/null
   return "$status"
@@ -280,6 +319,7 @@ case "${1:-}" in
   logs) tail -n "${2:-50}" "$LOG" ;;
   deploy) cmd_deploy ;;
   seed) cmd_seed ;;
+  seed-group) cmd_seed_group ;;
   models) cmd_models ;;
   e2e) shift; cmd_e2e "$@" ;;
   *) sed -n '2,16p' "$0"; exit 1 ;;

@@ -1,15 +1,22 @@
 /**
- * The Spine stage: owns the WebGL canvas, the loaded skeleton and its
- * animation state, the render loop, and interaction (drag to move, click to
+ * The Spine stage: owns the WebGL canvas, the loaded skeletons and their
+ * animation states, the render loop, and interaction (drag to move, click to
  * play the click animation). The canvas is drawn into a Lumiverse app overlay
  * or the settings tab's preview box, like the Live2D Avatars extension.
  *
+ * Every character in the chat that has a model gets one: one in a solo chat,
+ * one per member in a group chat. The stage is split into equal columns, one
+ * per model, left to right in member order, and each model is laid out inside
+ * its column as if that column were the whole stage. A solo chat's single
+ * column is the whole stage.
+ *
  * Layout model, all read from the per-model settings every frame:
  * - the model's reference bounds (its visible parts at frame 0 of the idle
- *   animation) are scaled to fit the stage at zoom 1, then multiplied by zoom;
+ *   animation) are scaled to fit its column at zoom 1, then multiplied by zoom;
  * - the model rotates about the center of those bounds;
- * - x / y move that center as a percent of half the stage size;
+ * - x / y move that center as a percent of half the column's size;
  * - render scale sets the canvas's backing resolution, not the model's size.
+ *   With several models the canvas uses the highest of their render scales.
  */
 
 import * as spine from '@esotericsoftware/spine-webgl';
@@ -69,8 +76,8 @@ export interface StageDeps {
   /** The stage changed the model's position or zoom itself (a drag). */
   layoutChanged(): void;
   assets: ModelAssets;
-  /** Send a click interaction message into the chat. */
-  sendInteraction(message: string): void;
+  /** Send a click interaction message into the chat, from a click on this character's model. */
+  sendInteraction(message: string, characterId: string): void;
   log(message: string): void;
 }
 
@@ -108,6 +115,16 @@ interface LoadedEntry {
   bounds: Bounds;
   textures: spine.GLTexture[];
   talkTimer: number | null;
+  starterTimer: number | null;
+  /** Column on the stage, counted from the left. */
+  slot: number;
+}
+
+/** A model's column on the stage, in host CSS pixels. */
+interface Slot {
+  x: number;
+  width: number;
+  height: number;
 }
 
 /** skeleton (x, y) -> host CSS pixels: sx = a*x + c*y + e, sy = b*x + d*y + f */
@@ -293,16 +310,19 @@ function pointInTriangle(
 export class Stage {
   private host: HTMLElement | null = null;
   private gl: Gl | null = null;
-  private loaded: LoadedEntry | null = null;
+  /** Models on stage, in draw order (left to right). */
+  private loaded: LoadedEntry[] = [];
+  /** Columns the stage is split into: one per character with a model. */
+  private slotCount = 1;
   private chatId: string | null = null;
-  private characterId: string | null = null;
+  /** Characters in the chat, in member order. */
+  private characterIds: string[] = [];
   private loadToken = 0;
   private frameRequest: number | null = null;
   private lastFrameTime = 0;
   private hostWidth = 0;
   private hostHeight = 0;
   private resizeObserver: ResizeObserver | null = null;
-  private starterTimer: number | null = null;
   private previousInteraction = { characterId: '', message: '' };
   private descriptionCache = new Map<string, ModelDescription>();
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
@@ -345,23 +365,39 @@ export class Stage {
     void this.reload();
   }
 
-  setChatContext(chatId: string | null, characterId: string | null): void {
-    const changed = chatId !== this.chatId || characterId !== this.characterId;
+  /** Show the models of these characters (the chat's members, in order). */
+  setChatContext(chatId: string | null, characterIds: string[]): void {
+    const unique = [...new Set(characterIds.filter(Boolean))];
+    const changed =
+      chatId !== this.chatId ||
+      unique.length !== this.characterIds.length ||
+      unique.some((id, index) => id !== this.characterIds[index]);
     this.chatId = chatId;
-    this.characterId = characterId;
+    this.characterIds = unique;
     if (changed) void this.reload();
   }
 
-  getChatContext(): { chatId: string | null; characterId: string | null } {
-    return { chatId: this.chatId, characterId: this.characterId };
+  getChatContext(): { chatId: string | null; characterIds: string[] } {
+    return { chatId: this.chatId, characterIds: [...this.characterIds] };
   }
 
-  currentModel(): { characterId: string; modelId: string } | null {
-    return this.loaded ? { characterId: this.loaded.characterId, modelId: this.loaded.modelId } : null;
+  /** Whether this character's model is loaded and drawn (optionally: this particular model). */
+  isOnStage(characterId: string, modelId?: string): boolean {
+    const entry = this.entryFor(characterId);
+    return entry !== undefined && (modelId === undefined || entry.modelId === modelId);
   }
 
-  getDescription(): ModelDescription | null {
-    return this.loaded?.description ?? null;
+  /** Characters whose models are on stage, left to right. */
+  charactersOnStage(): string[] {
+    return this.loaded.map((entry) => entry.characterId);
+  }
+
+  getDescription(characterId: string): ModelDescription | null {
+    return this.entryFor(characterId)?.description ?? null;
+  }
+
+  private entryFor(characterId: string): LoadedEntry | undefined {
+    return this.loaded.find((entry) => entry.characterId === characterId);
   }
 
   /** Rebuild the whole stage from current settings + chat context. */
@@ -370,29 +406,36 @@ export class Stage {
     const token = this.loadToken;
 
     const settings = this.deps.getSettings();
-    if (!settings.global.enabled || !this.host || !this.characterId) return;
-    const modelId = settings.characterModelMapping[this.characterId];
-    if (!modelId) return;
-    const record = this.deps.getModelRecord(modelId);
-    if (!record) return;
-
-    let bundle: ModelBundle;
-    try {
-      bundle = await this.deps.assets.load(record);
-    } catch (error) {
-      this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
-      return;
+    if (!settings.global.enabled || !this.host) return;
+    const cast: Array<{ characterId: string; record: ModelRecord }> = [];
+    for (const characterId of this.characterIds) {
+      const modelId = settings.characterModelMapping[characterId];
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record) cast.push({ characterId, record });
     }
-    if (token !== this.loadToken || !this.host) return;
+    if (cast.length === 0) return;
+    // Columns are handed out up front, so a model that loads late (or fails)
+    // doesn't shift the others.
+    this.slotCount = cast.length;
 
-    try {
-      await this.loadModel(record, bundle, token);
-    } catch (error) {
-      if (token === this.loadToken) {
-        this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
-        this.teardown();
-      }
-    }
+    // Each model appears as soon as it's ready; one failing doesn't stop the others.
+    await Promise.all(
+      cast.map(async ({ characterId, record }, slot) => {
+        let bundle: ModelBundle;
+        try {
+          bundle = await this.deps.assets.load(record);
+        } catch (error) {
+          this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
+          return;
+        }
+        if (token !== this.loadToken || !this.host) return;
+        try {
+          await this.loadModel(characterId, record, bundle, slot, token);
+        } catch (error) {
+          if (token === this.loadToken) this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
+        }
+      }),
+    );
   }
 
   private createGl(host: HTMLElement): Gl {
@@ -440,8 +483,8 @@ export class Stage {
         if (result.restoreTimer !== null) window.clearTimeout(result.restoreTimer);
         result.restoreTimer = null;
         // GLTexture.restore() resets filters and wraps to defaults; re-apply the atlas's.
-        const entry = this.loaded;
-        if (this.gl === result && entry) {
+        if (this.gl !== result) return;
+        for (const entry of this.loaded) {
           entry.atlas.pages.forEach((page, index) => {
             const texture = entry.textures[index];
             if (texture) page.setTexture(texture);
@@ -455,8 +498,13 @@ export class Stage {
     }
   }
 
-  private async loadModel(record: ModelRecord, bundle: ModelBundle, token: number): Promise<void> {
-    const characterId = this.characterId!;
+  private async loadModel(
+    characterId: string,
+    record: ModelRecord,
+    bundle: ModelBundle,
+    slot: number,
+    token: number,
+  ): Promise<void> {
     const host = this.host!;
     const atlas = await readAtlas(bundle);
 
@@ -488,14 +536,18 @@ export class Stage {
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     const modelSettings = this.deps.getModelSettings(characterId, record.id, description);
 
-    let gl: Gl;
-    try {
-      gl = this.createGl(host);
-    } catch (error) {
-      closeImages();
-      throw error;
+    // The models share one canvas: the first one ready creates it.
+    let gl = this.gl;
+    if (!gl) {
+      try {
+        gl = this.createGl(host);
+      } catch (error) {
+        closeImages();
+        throw error;
+      }
+      this.gl = gl;
+      this.observeSize(gl.canvas);
     }
-    this.gl = gl;
     const textures: spine.GLTexture[] = [];
     try {
       atlas.pages.forEach((page, index) => {
@@ -530,22 +582,27 @@ export class Stage {
       bounds: { x: 0, y: 0, width: 1, height: 1 },
       textures,
       talkTimer: null,
+      starterTimer: null,
+      slot,
     };
     // Owned by the stage from here on, so teardown frees it on any later failure.
-    this.loaded = entry;
+    // Keep the draw order left to right whatever order the models finish loading in.
+    this.loaded.push(entry);
+    this.loaded.sort((a, b) => a.slot - b.slot);
     this.applySkinTo(entry, modelSettings);
     this.startIdle(entry, modelSettings);
     entry.bounds = measureReferenceBounds(data, modelSettings);
 
-    this.observeSize(gl.canvas);
-    this.lastFrameTime = performance.now();
-    this.frameRequest = window.requestAnimationFrame(this.frame);
+    if (this.frameRequest === null) {
+      this.lastFrameTime = performance.now();
+      this.frameRequest = window.requestAnimationFrame(this.frame);
+    }
 
     const starter = modelSettings.animation_starter;
     if (starter.animation !== 'none') {
-      this.starterTimer = window.setTimeout(() => {
-        this.starterTimer = null;
-        if (this.loaded === entry) this.playAnimation(starter.animation);
+      entry.starterTimer = window.setTimeout(() => {
+        entry.starterTimer = null;
+        if (this.loaded.includes(entry)) this.playAnimation(characterId, starter.animation);
       }, Math.max(0, starter.delay));
     }
   }
@@ -574,24 +631,28 @@ export class Stage {
 
   private frame = (now: number): void => {
     this.frameRequest = null;
-    const entry = this.loaded;
     const gl = this.gl;
-    if (!entry || !gl) return;
+    if (this.loaded.length === 0 || !gl) return;
     this.frameRequest = window.requestAnimationFrame(this.frame);
 
     const delta = Math.min(MAX_DELTA, Math.max(0, (now - this.lastFrameTime) / 1000));
     this.lastFrameTime = now;
-    const settings = this.settingsFor(entry);
-    const step = delta * settings.speed;
-    entry.state.update(step);
-    entry.state.apply(entry.skeleton);
-    entry.skeleton.updateWorldTransform();
+    let renderScale = 0;
+    const drawn: Array<{ entry: LoadedEntry; settings: ModelSettings }> = [];
+    for (const entry of this.loaded) {
+      const settings = this.settingsFor(entry);
+      entry.state.update(delta * settings.speed);
+      entry.state.apply(entry.skeleton);
+      entry.skeleton.updateWorldTransform();
+      renderScale = Math.max(renderScale, settings.renderScale);
+      drawn.push({ entry, settings });
+    }
 
     const width = this.hostWidth;
     const height = this.hostHeight;
     if (width === 0 || height === 0 || gl.context.gl.isContextLost()) return;
-    this.resizeCanvas(gl, width, height, settings.renderScale);
-    this.draw(gl, entry, settings, width, height);
+    this.resizeCanvas(gl, width, height, renderScale);
+    this.draw(gl, drawn, width, height);
   };
 
   private resizeCanvas(gl: Gl, width: number, height: number, renderScale: number): void {
@@ -611,13 +672,25 @@ export class Stage {
     if (gl.canvas.height !== pixelHeight) gl.canvas.height = pixelHeight;
   }
 
-  private draw(gl: Gl, entry: LoadedEntry, settings: ModelSettings, width: number, height: number): void {
+  private draw(
+    gl: Gl,
+    drawn: Array<{ entry: LoadedEntry; settings: ModelSettings }>,
+    width: number,
+    height: number,
+  ): void {
     const context = gl.context.gl;
     // The browser may give the canvas a smaller buffer than asked for; draw into what it has.
     context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
     context.clearColor(0, 0, 0, 0);
     context.clear(context.COLOR_BUFFER_BIT);
+    const showBounds = this.deps.getSettings().global.showBounds;
+    for (const { entry, settings } of drawn) {
+      this.drawEntry(gl, entry, settings, width, height);
+      if (showBounds) this.drawDebug(gl, entry, gl.mvp.values);
+    }
+  }
 
+  private drawEntry(gl: Gl, entry: LoadedEntry, settings: ModelSettings, width: number, height: number): void {
     const t = this.transform(entry, settings, width, height);
     // Host CSS pixels -> clip space, folded into the skeleton transform.
     const m = gl.mvp.values;
@@ -639,8 +712,6 @@ export class Stage {
     gl.renderer.draw(gl.batcher, entry.skeleton);
     gl.batcher.end();
     gl.shader.unbind();
-
-    if (this.deps.getSettings().global.showBounds) this.drawDebug(gl, entry, m);
   }
 
   private drawDebug(gl: Gl, entry: LoadedEntry, mvp: Float32Array): void {
@@ -665,8 +736,15 @@ export class Stage {
 
   // ── Layout ────────────────────────────────────────────────────────────────
 
+  /** The model's column for this stage size. */
+  private slotOf(entry: LoadedEntry, width: number, height: number): Slot {
+    const slotWidth = width / Math.max(1, this.slotCount);
+    return { x: slotWidth * entry.slot, width: slotWidth, height };
+  }
+
   /** The skeleton -> host-pixel transform for the current settings and stage size. */
-  private transform(entry: LoadedEntry, settings: ModelSettings, width: number, height: number): Affine {
+  private transform(entry: LoadedEntry, settings: ModelSettings, stageWidth: number, stageHeight: number): Affine {
+    const { x: left, width, height } = this.slotOf(entry, stageWidth, stageHeight);
     const bounds = entry.bounds;
     const fit = Math.min(width / bounds.width, height / bounds.height);
     const scale = fit * settings.zoom;
@@ -675,7 +753,7 @@ export class Stage {
     const sin = Math.sin(angle);
     const centerX = bounds.x + bounds.width / 2;
     const centerY = bounds.y + bounds.height / 2;
-    const targetX = width / 2 + ((width / 2) * settings.x) / 100;
+    const targetX = left + width / 2 + ((width / 2) * settings.x) / 100;
     const targetY = height / 2 + ((height / 2) * settings.y) / 100;
     // Skeleton space is y-up and the screen is y-down; rotation is clockwise on screen.
     const a = scale * cos;
@@ -695,15 +773,14 @@ export class Stage {
   }
 
   /**
-   * Zoom so the whole model fits the stage at its current rotation, and center it.
-   * Returns false when no model is on stage.
+   * Zoom so the whole model fits its column at its current rotation, and center it.
+   * Returns false when the model isn't on stage.
    */
   fitToCanvas(characterId: string, modelId: string): boolean {
-    const entry = this.loaded;
-    if (!entry || entry.characterId !== characterId || entry.modelId !== modelId) return false;
-    const width = this.hostWidth;
-    const height = this.hostHeight;
-    if (width === 0 || height === 0) return false;
+    const entry = this.entryFor(characterId);
+    if (!entry || entry.modelId !== modelId) return false;
+    if (this.hostWidth === 0 || this.hostHeight === 0) return false;
+    const { width, height } = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const settings = this.settingsFor(entry);
     const { width: boundsWidth, height: boundsHeight } = entry.bounds;
     const angle = (settings.rotation * Math.PI) / 180;
@@ -743,8 +820,8 @@ export class Stage {
   }
 
   /** Re-apply the skin after the setting changes. The reference bounds follow it, as on the next load. */
-  applySkin(): void {
-    const entry = this.loaded;
+  applySkin(characterId: string): void {
+    const entry = this.entryFor(characterId);
     if (!entry) return;
     const settings = this.settingsFor(entry);
     this.applySkinTo(entry, settings);
@@ -752,17 +829,17 @@ export class Stage {
   }
 
   /** Switch to the idle animation after the setting changes. The reference bounds follow it, as on the next load. */
-  applyIdle(): void {
-    const entry = this.loaded;
+  applyIdle(characterId: string): void {
+    const entry = this.entryFor(characterId);
     if (!entry) return;
     const settings = this.settingsFor(entry);
     this.startIdle(entry, settings);
     entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
   }
 
-  /** Play an animation once on the base track, then go back to idling. */
-  playAnimation(name: string): void {
-    const entry = this.loaded;
+  /** Play an animation once on a character's base track, then go back to idling. */
+  playAnimation(characterId: string, name: string): void {
+    const entry = this.entryFor(characterId);
     if (!entry) return;
     const animation = this.findAnimation(entry, name);
     if (!animation) return;
@@ -772,9 +849,9 @@ export class Stage {
     else entry.state.addEmptyAnimation(0, DEFAULT_MIX, 0);
   }
 
-  /** Loop the talk animation on its own track for a time based on the message length. */
-  playTalk(textLength: number): void {
-    const entry = this.loaded;
+  /** Loop a character's talk animation on its own track for a time based on the message length. */
+  playTalk(characterId: string, textLength: number): void {
+    const entry = this.entryFor(characterId);
     if (!entry || textLength <= 0) return;
     const settings = this.settingsFor(entry);
     const talk = this.findAnimation(entry, settings.animation_talk);
@@ -790,7 +867,7 @@ export class Stage {
     const duration = (textLength * settings.talk_time_per_character) / speed;
     entry.talkTimer = window.setTimeout(() => {
       entry.talkTimer = null;
-      if (this.loaded === entry) entry.state.setEmptyAnimation(1, DEFAULT_MIX);
+      if (this.loaded.includes(entry)) entry.state.setEmptyAnimation(1, DEFAULT_MIX);
     }, duration);
   }
 
@@ -812,26 +889,30 @@ export class Stage {
   // ── Interaction ───────────────────────────────────────────────────────────
 
   /**
-   * Whether a pointer event at this position belongs to the model: the model's
+   * The model a pointer event at this position belongs to, or null: the
    * canvas must be the topmost layer there (no drawer or modal above it), the
    * element underneath must not be a control (input, button, link…), and the
-   * point must fall on one of the model's visible drawn parts.
+   * point must fall on one of a model's visible drawn parts. Where models
+   * overlap, the one drawn on top wins.
    */
-  private isModelInteraction(event: PointerEvent): boolean {
-    const entry = this.loaded;
+  private modelAt(event: PointerEvent): LoadedEntry | null {
     const canvas = this.gl?.canvas;
-    if (!entry || !canvas) return false;
+    if (this.loaded.length === 0 || !canvas) return null;
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(INTERACTIVE_SELECTOR)) return false;
+    if (target?.closest(INTERACTIVE_SELECTOR)) return null;
 
     const previous = canvas.style.pointerEvents;
     canvas.style.pointerEvents = 'auto';
     const topmost = document.elementFromPoint(event.clientX, event.clientY);
     canvas.style.pointerEvents = previous;
-    if (topmost !== canvas) return false;
+    if (topmost !== canvas) return null;
 
     const point = this.toStagePoint(event);
-    return this.isOverModel(entry, point.x, point.y);
+    for (let i = this.loaded.length - 1; i >= 0; i--) {
+      const entry = this.loaded[i]!;
+      if (this.isOverModel(entry, point.x, point.y)) return entry;
+    }
+    return null;
   }
 
   private isOverModel(entry: LoadedEntry, stageX: number, stageY: number): boolean {
@@ -871,15 +952,17 @@ export class Stage {
   /** The model's center in host pixels. */
   private modelCenter(entry: LoadedEntry): { x: number; y: number } {
     const settings = this.settingsFor(entry);
+    const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     return {
-      x: this.hostWidth / 2 + ((this.hostWidth / 2) * settings.x) / 100,
-      y: this.hostHeight / 2 + ((this.hostHeight / 2) * settings.y) / 100,
+      x: slot.x + slot.width / 2 + ((slot.width / 2) * settings.x) / 100,
+      y: slot.height / 2 + ((slot.height / 2) * settings.y) / 100,
     };
   }
 
   private onPointerDown(event: PointerEvent): void {
-    if (event.button !== 0 || !this.isModelInteraction(event)) return;
-    const entry = this.loaded!;
+    if (event.button !== 0) return;
+    const entry = this.modelAt(event);
+    if (!entry) return;
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -902,30 +985,31 @@ export class Stage {
       this.dragTo(drag, event);
       return;
     }
-    if (!this.loaded) return;
+    if (this.loaded.length === 0) return;
     if (event.pointerType === 'mouse' && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.isModelInteraction(event));
+        this.setHovering(this.modelAt(event) !== null);
       });
     }
   }
 
   private dragTo(drag: NonNullable<Stage['drag']>, event: PointerEvent): void {
     const { entry } = drag;
-    if (this.loaded !== entry || this.hostWidth === 0 || this.hostHeight === 0) return;
+    if (!this.loaded.includes(entry) || this.hostWidth === 0 || this.hostHeight === 0) return;
     const point = this.toStagePoint(event);
     const center = this.modelCenter(entry);
     const newX = point.x - drag.offsetX;
     const newY = point.y - drag.offsetY;
     if (!drag.moved && Math.abs(newX - center.x) < 3 && Math.abs(newY - center.y) < 3) return;
     drag.moved = true;
-    // Persist as percent offsets of the model's center from the stage center.
+    // Persist as percent offsets of the model's center from its column's center.
     const settings = this.settingsFor(entry);
+    const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const { min, max } = SETTINGS_LIMITS.offset;
     const percent = (value: number) => Math.min(max, Math.max(min, Math.round(value * 100) / 100));
-    settings.x = percent(((newX - this.hostWidth / 2) / (this.hostWidth / 2)) * 100);
-    settings.y = percent(((newY - this.hostHeight / 2) / (this.hostHeight / 2)) * 100);
+    settings.x = percent(((newX - slot.x - slot.width / 2) / (slot.width / 2)) * 100);
+    settings.y = percent(((newY - slot.height / 2) / (slot.height / 2)) * 100);
     this.deps.saveSettingsDebounced();
     this.deps.layoutChanged();
   }
@@ -936,7 +1020,7 @@ export class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded === drag.entry) this.onModelClick(drag.entry);
+    if (!drag.moved && this.loaded.includes(drag.entry)) this.onModelClick(drag.entry);
   }
 
   private endDrag(): void {
@@ -976,10 +1060,10 @@ export class Stage {
         this.deps.log('Same as last interaction, message not sent again.');
       } else {
         this.previousInteraction = { characterId: entry.characterId, message: click.message };
-        this.deps.sendInteraction(click.message);
+        this.deps.sendInteraction(click.message, entry.characterId);
       }
     }
-    if (click.animation !== 'none') this.playAnimation(click.animation);
+    if (click.animation !== 'none') this.playAnimation(entry.characterId, click.animation);
   }
 
   // ── Teardown ──────────────────────────────────────────────────────────────
@@ -997,14 +1081,12 @@ export class Stage {
       window.cancelAnimationFrame(this.frameRequest);
       this.frameRequest = null;
     }
-    if (this.starterTimer !== null) {
-      window.clearTimeout(this.starterTimer);
-      this.starterTimer = null;
-    }
-    const entry = this.loaded;
-    this.loaded = null;
-    if (entry) {
+    const entries = this.loaded;
+    this.loaded = [];
+    this.slotCount = 1;
+    for (const entry of entries) {
       if (entry.talkTimer !== null) window.clearTimeout(entry.talkTimer);
+      if (entry.starterTimer !== null) window.clearTimeout(entry.starterTimer);
       for (const texture of entry.textures) {
         try {
           texture.dispose();

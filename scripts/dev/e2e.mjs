@@ -11,6 +11,9 @@
 //   lumiverse.sh e2e              # the check above
 //   lumiverse.sh e2e --keep-open  # also leave a screenshot with the Spine tab open
 //   lumiverse.sh e2e --controls   # also drive every model control, screenshot each and check its effect
+//   lumiverse.sh e2e --group      # a three-member group chat: every member's model is drawn in its
+//                                 # own column, drags and talking reach the right model, and
+//                                 # removing a member re-lays the stage out
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -23,6 +26,10 @@ const CHAT = `${BASE}/chat/${process.env.LUMI_CHAT_ID}`;
 const OUT = process.env.LUMI_OUT;
 const keepOpen = process.argv.includes('--keep-open');
 const controls = process.argv.includes('--controls');
+const group = process.argv.includes('--group');
+const MODEL_ZIPS = (process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP).split('\n').filter(Boolean);
+const GROUP_CHAT = `${BASE}/chat/${process.env.LUMI_GROUP_CHAT_ID}`;
+const GROUP_MEMBERS = (process.env.LUMI_GROUP_MEMBERS || '').split('\n').filter(Boolean);
 // The extension names an imported model after its zip file.
 const MODEL_NAME = path.basename(process.env.LUMI_MODEL_ZIP).replace(/\.zip$/i, '');
 fs.mkdirSync(OUT, { recursive: true });
@@ -368,12 +375,356 @@ async function runControls() {
   await page.waitForTimeout(1000);
 }
 
+
+// ── Group chat ──────────────────────────────────────────────────────────────
+
+const modelName = (zip) => path.basename(zip).replace(/\.zip$/i, '');
+
+async function importModel(zip) {
+  const name = modelName(zip);
+  const inLibrary = (name) =>
+    [...document.querySelectorAll('.spn-model-name')].some((node) => node.textContent === name);
+  if (await page.evaluate(inLibrary, name)) return;
+  console.log(`Importing ${name}…`);
+  const [chooser] = await Promise.all([
+    page.waitForEvent('filechooser', { timeout: 15000 }),
+    page.click('button:has-text("Import model")'),
+  ]);
+  await chooser.setFiles(zip);
+  await page.waitForFunction(inLibrary, name, { timeout: 300000 });
+}
+
+/** Pick a character in the Character model section; returns its option label. */
+async function selectCharacter(characterId) {
+  const label = await page.evaluate((characterId) => {
+    const section = [...document.querySelectorAll('.spn-section')].find(
+      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
+    );
+    const select = section?.querySelector('select');
+    if (!select) throw new Error('No character select');
+    if (select.value !== characterId) {
+      select.value = characterId;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return select.selectedOptions[0]?.textContent;
+  }, characterId);
+  await page.waitForTimeout(300);
+  return label;
+}
+
+async function bindModel(name) {
+  await page.evaluate((name) => {
+    const section = [...document.querySelectorAll('.spn-section')].find(
+      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
+    );
+    const modelSelect = section.querySelectorAll('select')[1];
+    const option = [...modelSelect.options].find((o) => o.textContent === name);
+    if (!option) throw new Error(`${name} missing from the model list`);
+    if (modelSelect.value !== option.value) {
+      modelSelect.value = option.value;
+      modelSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, name);
+  await page.waitForTimeout(500);
+}
+
+async function selectByLabel(label, value) {
+  await page.evaluate(
+    ({ label, value }) => {
+      const select = document.querySelector(`.spn-root select[aria-label="${label}"]`);
+      if (!select) throw new Error(`No select labelled "${label}"`);
+      select.value = value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    },
+    { label, value },
+  );
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Per column of the stage: the share of its pixels drawn, the drawn box, and
+ * how much of it changes between frames (motion), sampled a few times.
+ */
+async function columnInfo(columns, samples = 4) {
+  return page.evaluate(
+    ({ columns, samples }) =>
+      new Promise((resolve) => {
+        const canvas = document.querySelector('.spine-avatars-canvas');
+        if (!canvas) return resolve(null);
+        const rect = canvas.getBoundingClientRect();
+        const scale = 0.25;
+        const probe = document.createElement('canvas');
+        probe.width = Math.max(1, Math.round(rect.width * scale));
+        probe.height = Math.max(1, Math.round(rect.height * scale));
+        const context = probe.getContext('2d', { willReadFrequently: true });
+        const grab = () => {
+          context.clearRect(0, 0, probe.width, probe.height);
+          context.drawImage(canvas, 0, 0, probe.width, probe.height);
+          return context.getImageData(0, 0, probe.width, probe.height).data;
+        };
+        const frames = [];
+        const next = () =>
+          requestAnimationFrame(() => {
+            frames.push(grab());
+            if (frames.length <= samples) setTimeout(next, 150);
+            else finish();
+          });
+        const finish = () => {
+          const columnWidth = probe.width / columns;
+          const result = [];
+          for (let column = 0; column < columns; column++) {
+            const x0 = Math.round(column * columnWidth);
+            const x1 = Math.round((column + 1) * columnWidth);
+            let drawn = 0;
+            let changed = 0;
+            let minX = Infinity;
+            let maxX = -Infinity;
+            let minY = Infinity;
+            let maxY = -Infinity;
+            for (let y = 0; y < probe.height; y++) {
+              for (let x = x0; x < x1; x++) {
+                const i = (y * probe.width + x) * 4;
+                if (frames[0][i + 3] > 16) {
+                  drawn++;
+                  minX = Math.min(minX, x);
+                  maxX = Math.max(maxX, x);
+                  minY = Math.min(minY, y);
+                  maxY = Math.max(maxY, y);
+                }
+                for (let f = 1; f < frames.length; f++) {
+                  const a = frames[f - 1];
+                  const b = frames[f];
+                  if (Math.abs(a[i + 3] - b[i + 3]) > 24 || Math.abs(a[i] - b[i]) > 24) changed++;
+                }
+              }
+            }
+            const area = (x1 - x0) * probe.height;
+            result.push({
+              drawnFraction: drawn / area,
+              motion: changed / area / (frames.length - 1),
+              box: drawn
+                ? {
+                    x: Math.round(minX / scale),
+                    y: Math.round(minY / scale),
+                    width: Math.round((maxX - minX + 1) / scale),
+                    height: Math.round((maxY - minY + 1) / scale),
+                  }
+                : null,
+            });
+          }
+          resolve({ width: Math.round(rect.width), height: Math.round(rect.height), columns: result });
+        };
+        next();
+      }),
+    { columns, samples },
+  );
+}
+
+async function postCharacterMessage(chatId, characterId, content) {
+  return page.evaluate(
+    async ({ chatId, characterId, content }) => {
+      const response = await fetch(`/api/v1/chats/${chatId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Spine Test', content, is_user: false, extra: { character_id: characterId } }),
+      });
+      return response.status;
+    },
+    { chatId, characterId, content },
+  );
+}
+
+async function runGroup() {
+  console.log('── Group chat ──');
+  const members = GROUP_MEMBERS;
+  if (members.length < 2) throw new Error('No group chat members; run lumiverse.sh seed-group');
+  await page.goto(GROUP_CHAT);
+  await page.waitForTimeout(5000);
+  await openSpineTab();
+  for (const zip of MODEL_ZIPS) await importModel(zip);
+
+  // Member i gets model i (wrapping around), so with one zip every member shares it.
+  const names = MODEL_ZIPS.map(modelName);
+  for (const [index, characterId] of members.entries()) {
+    const label = await selectCharacter(characterId);
+    await bindModel(names[index % names.length]);
+    console.log(`bound ${names[index % names.length]} to ${label}`);
+  }
+  const labels = await page.evaluate(() => {
+    const section = [...document.querySelectorAll('.spn-section')].find(
+      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
+    );
+    return [...(section?.querySelector('select')?.options ?? [])].map((o) => o.textContent);
+  });
+  check(
+    labels.slice(0, members.length).every((label) => label.endsWith('(in this chat)')),
+    `group members listed first in the character picker: ${labels.slice(0, members.length).join(', ')}`,
+  );
+  // Fit every model to its column, upright and centered.
+  for (const characterId of members) {
+    await selectCharacter(characterId);
+    await waitForModelSettings();
+    await setSlider('Rotation', 0);
+    await clickButton('Fit to canvas');
+  }
+  await page.waitForTimeout(1500);
+
+  await page.goto(GROUP_CHAT);
+  const appeared = await page
+    .waitForSelector('.spine-avatars-canvas', { timeout: 180000 })
+    .then(() => true, () => false);
+  check(appeared, 'group chat shows the stage');
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `${OUT}/group-chat.png` });
+
+  let info = await columnInfo(members.length);
+  console.log('Columns:', JSON.stringify(info.columns.map((c) => ({ drawn: +c.drawnFraction.toFixed(3), box: c.box }))));
+  const columnWidth = info.width / members.length;
+  info.columns.forEach((column, index) => {
+    const centerX = column.box ? column.box.x + column.box.width / 2 : NaN;
+    const inColumn = centerX > index * columnWidth && centerX < (index + 1) * columnWidth;
+    check(
+      column.drawnFraction > 0.01 && inColumn,
+      `member ${index + 1}'s model is drawn in column ${index + 1} (${(column.drawnFraction * 100).toFixed(1)}% drawn, center x ${Math.round(centerX)})`,
+    );
+  });
+
+  // Dragging the first member's model moves only it, by a share of its column.
+  await openSpineTab();
+  await selectCharacter(members[0]);
+  await waitForModelSettings();
+  // Shrink it so it stays inside its column (which is all columnInfo measures) after the drag.
+  await setSlider('Zoom', 0.6);
+  info = await columnInfo(members.length);
+  const first = info.columns[0].box;
+  const second = info.columns[1].box;
+  // The middle of the box can fall between limbs; a third of the way down is the head.
+  const grabX = first.x + first.width / 2;
+  const grabY = first.y + first.height * 0.3;
+  await page.mouse.move(grabX, grabY);
+  await page.mouse.down();
+  await page.mouse.move(grabX + 40, grabY, { steps: 5 });
+  await page.mouse.move(grabX + 80, grabY + 30, { steps: 5 });
+  await page.mouse.up();
+  await page.waitForTimeout(500);
+  const afterDrag = await columnInfo(members.length);
+  const moved = afterDrag.columns[0].box;
+  const others = afterDrag.columns[1].box;
+  const shift = moved.x + moved.width / 2 - (first.x + first.width / 2);
+  const otherShift = Math.max(Math.abs(others.x - second.x), Math.abs(others.y - second.y));
+  check(
+    Math.abs(shift - 80) < 12 && otherShift < 16,
+    `drag moves member 1's model 80px (${shift}px) and leaves member 2's (${otherShift}px, idle sway)`,
+  );
+  await page.screenshot({ path: `${OUT}/group-dragged.png` });
+  await openSpineTab();
+  await selectCharacter(members[0]);
+  await waitForModelSettings();
+  const draggedX = await sliderValue('X offset');
+  const expectedX = (80 / (columnWidth / 2)) * 100;
+  check(
+    Math.abs(draggedX - expectedX) < 2,
+    `member 1's X offset is relative to its column: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
+  );
+  await clickButton('Fit to canvas');
+
+  // A message from the last member makes only that member's model talk. Give it
+  // a talk animation that moves a lot, and the other members none.
+  const talker = members.length - 1;
+  let talkAnimation = null;
+  for (const [index, characterId] of members.entries()) {
+    await selectCharacter(characterId);
+    await waitForModelSettings();
+    if (index !== talker) {
+      await selectByLabel('While talking', 'none');
+      continue;
+    }
+    talkAnimation = await page.evaluate(() => {
+      const select = document.querySelector('.spn-root select[aria-label="While talking"]');
+      const idle = document.querySelector('.spn-root select[aria-label="Idle (loops)"]')?.value;
+      const values = [...select.options].map((o) => o.value).filter((v) => v !== 'none' && v !== idle);
+      return values.find((v) => /run|walk|jump|talk/i.test(v)) ?? values[0] ?? null;
+    });
+    await selectByLabel('While talking', talkAnimation);
+    await setSlider('Talk time per character (ms)', 100);
+  }
+  await page.waitForTimeout(1500);
+  const quiet = await columnInfo(members.length, 6);
+  const status = await postCharacterMessage(
+    process.env.LUMI_GROUP_CHAT_ID,
+    members[talker],
+    'This is a fairly long line of dialogue so that the talking animation keeps playing for a few seconds.',
+  );
+  await page.waitForTimeout(1200);
+  const talking = await columnInfo(members.length, 6);
+  await page.screenshot({ path: `${OUT}/group-talking.png` });
+  const motion = (info) => info.columns.map((c) => +c.motion.toFixed(4));
+  console.log(`Motion before ${JSON.stringify(motion(quiet))}, while member ${talker + 1} talks ${JSON.stringify(motion(talking))} (talk animation: ${talkAnimation})`);
+  check(status === 201, `posted a message from member ${talker + 1} (HTTP ${status})`);
+  check(
+    talking.columns[talker].motion > quiet.columns[talker].motion * 1.5 + 0.002,
+    `member ${talker + 1}'s model talks after its message`,
+  );
+  check(
+    talking.columns.every((c, i) => i === talker || c.motion < quiet.columns[i].motion * 1.5 + 0.002),
+    'the other members keep idling',
+  );
+
+  // Removing a member re-lays out the stage without a reload.
+  const removed = members[members.length - 1];
+  const removeStatus = await page.evaluate(
+    async ({ chatId, characterId }) =>
+      (await fetch(`/api/v1/chats/${chatId}/members/${characterId}`, { method: 'DELETE' })).status,
+    { chatId: process.env.LUMI_GROUP_CHAT_ID, characterId: removed },
+  );
+  await page.waitForTimeout(4000);
+  const two = await columnInfo(members.length - 1);
+  await page.screenshot({ path: `${OUT}/group-member-removed.png` });
+  console.log('After removal:', JSON.stringify(two.columns.map((c) => ({ drawn: +c.drawnFraction.toFixed(3), box: c.box }))));
+  const twoWidth = two.width / (members.length - 1);
+  check(
+    removeStatus < 300 &&
+      two.columns.every((c, i) => c.box && c.box.x + c.box.width / 2 > i * twoWidth && c.box.x + c.box.width / 2 < (i + 1) * twoWidth),
+    `after removing member ${members.length} (HTTP ${removeStatus}), the rest share the stage in ${members.length - 1} columns`,
+  );
+  // Put the member back for the next run.
+  await page.evaluate(
+    async ({ chatId, characterId }) =>
+      fetch(`/api/v1/chats/${chatId}/members/${characterId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skip_greeting: true }),
+      }),
+    { chatId: process.env.LUMI_GROUP_CHAT_ID, characterId: removed },
+  );
+  await page.waitForTimeout(3000);
+  const three = await columnInfo(members.length);
+  check(
+    three.columns.every((c) => c.drawnFraction > 0.01),
+    `after adding member ${members.length} back, all ${members.length} models are drawn`,
+  );
+  await page.screenshot({ path: `${OUT}/group-member-added.png` });
+}
+
 try {
   await page.goto(BASE);
   await page.fill('input[type="text"]', process.env.LUMI_USER);
   await page.fill('input[type="password"]', process.env.LUMI_PASS);
   await page.click('button[type="submit"]');
   await page.waitForTimeout(4000);
+
+  if (group) {
+    await runGroup();
+    console.log(`Screenshots: ${OUT}`);
+    for (const problem of problems) console.log(problem);
+    if (failures.length > 0) {
+      console.log(`FAIL: ${failures.length} check(s) failed`);
+      process.exitCode = 1;
+    } else {
+      console.log('OK: group chat checks passed');
+    }
+    process.exit();
+  }
 
   await page.goto(CHAT);
   await page.waitForTimeout(5000);

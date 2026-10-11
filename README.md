@@ -8,9 +8,10 @@ Plays skeletons exported from **Spine 4.1** (binary `.skel` or `.json`), with th
 
 - **Model library**: import Spine model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached in the browser (Cache Storage) for instant reloads.
 - **Per-character bindings**: assign a model to each character; it loads when you open that character's chat.
+- **Group chats**: every member with a model is on stage at once. The stage is split into equal columns, one per model, left to right in member order, and each model's zoom, offsets and *Fit to canvas* work within its own column (a solo chat's one column is the whole stage). Talking, emotion and click animations play on the member they belong to, and clicking a member's model with *Auto-send interaction* on gets the reply from that member. Members joining or leaving re-lay the stage out.
 - **View controls** (per character and model):
   - **Render scale**: the resolution the model is drawn at, relative to the screen. Lower is faster and softer, higher is sharper. It doesn't change the model's size.
-  - **Zoom**: the model's size. At 1 the model fits the stage upright.
+  - **Zoom**: the model's size. At 1 the model fits the stage (its column, in a group chat) upright.
   - **Rotation**: −180° to 180°, about the model's center.
   - **Playback speed**: 0 (paused) to 3×.
   - **Premultiplied alpha**: how texture colors are blended. Defaults to the atlas's `pma` flag; flip it if edges look dark or haloed.
@@ -41,8 +42,8 @@ The extension works with whatever you grant and degrades gracefully:
 |---|---|---|
 | `app_manipulation` | rendering the avatar as a full-app overlay | the avatar renders inside the Spine drawer tab preview |
 | `generation` | LLM emotion classification | no automatic emotion detection (native/off modes still work) |
-| `chat_mutation` | reading messages (emotion + talking) and sending click messages | no talking animation, no click messages |
-| `chats` | resolving which character the active chat belongs to | falls back to the frontend's active-chat context |
+| `chat_mutation` | sending click messages | no click messages |
+| `chats` | reading which characters are in the active chat | group chats show only the chat's first character |
 | `characters` | listing characters by name in the binding UI | bind models to the current chat's character only |
 
 ## Usage
@@ -52,6 +53,7 @@ The extension works with whatever you grant and degrades gracefully:
 3. **Import a model**: zip the exported folder (the `.skel` or `.json` skeleton, its `.atlas`, and the atlas page images) and use *Import model (.zip)*. A single top-level folder inside the zip is fine. The model is named after the zip file.
 4. **Bind it to a character** under *Character model*.
 5. Open that character's chat and the avatar appears. Adjust it under *Model settings*.
+6. For a group chat, bind a model to each member you want on stage. The members of the open chat are listed first in the character picker.
 
 ## How it works
 
@@ -75,7 +77,6 @@ To try the extension in a real local Lumiverse instance (Linux), use `scripts/de
 ## Known limitations
 
 - Spine 4.1 skeletons only. Other versions are rejected at import with a message naming the version; the binary formats differ between Spine versions.
-- One model on stage at a time (the active chat's character).
 - Clicks hit-test the model's region and mesh shapes, so fully transparent areas inside a part still count as the model.
 
 ## License
