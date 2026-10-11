@@ -6,9 +6,10 @@
  *
  * Every character in the chat that has a model gets one: one in a solo chat,
  * one per member in a group chat. The stage is split into equal columns, one
- * per model, left to right in member order, and each model is laid out inside
- * its column as if that column were the whole stage. A solo chat's single
- * column is the whole stage.
+ * per member with a model, left to right in member order, and each model is
+ * laid out inside its column as if that column were the whole stage. A solo
+ * chat's single column is the whole stage. Members with a Live2D model (from
+ * the Live2D Avatars extension) get columns too; see columns.ts.
  *
  * Layout model, all read from the per-model settings every frame:
  * - the model's reference bounds (its visible parts at frame 0 of the idle
@@ -21,6 +22,7 @@
 
 import * as spine from '@esotericsoftware/spine-webgl';
 import type { ModelAssets, ModelBundle } from './assets';
+import { type Columns, SharedColumns, sameColumns } from './columns';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
   type ModelDescription,
@@ -76,6 +78,8 @@ export interface StageDeps {
   /** Returns (creating if needed) the per-character per-model settings object. */
   getModelSettings(characterId: string, modelId: string, description: ModelDescription | null): ModelSettings;
   saveSettingsDebounced(): void;
+  /** Whether the stage draws over the app (rather than in the settings tab), where other avatar extensions draw too. */
+  drawsOverApp(): boolean;
   /** The stage changed the model's position or zoom itself (a drag). */
   layoutChanged(): void;
   assets: ModelAssets;
@@ -122,8 +126,6 @@ interface LoadedEntry {
   talkTimer: number | null;
   starterTimer: number | null;
   thumbnailTimer: number | null;
-  /** Column on the stage, counted from the left. */
-  slot: number;
 }
 
 /** A model's column on the stage, in host CSS pixels. */
@@ -318,11 +320,12 @@ export class Stage {
   private gl: Gl | null = null;
   /** Models on stage, in draw order (left to right). */
   private loaded: LoadedEntry[] = [];
-  /** Columns the stage is split into: one per character with a model. */
-  private slotCount = 1;
   private chatId: string | null = null;
   /** Characters in the chat, in member order. */
   private characterIds: string[] = [];
+  /** Columns the stage is split into: one per member with a model, here or in the Live2D extension. */
+  private columns: Columns = { count: 1, index: new Map() };
+  private readonly sharedColumns: SharedColumns;
   private loadToken = 0;
   private frameRequest: number | null = null;
   private lastFrameTime = 0;
@@ -351,6 +354,7 @@ export class Stage {
 
   constructor(private deps: StageDeps) {
     for (const [target, type, listener, options] of this.listeners) target.addEventListener(type, listener, options);
+    this.sharedColumns = new SharedColumns('spine_avatars', () => this.updateColumns());
   }
 
   destroy(): void {
@@ -361,6 +365,7 @@ export class Stage {
     this.hoverFrame = null;
     this.setHovering(false);
     this.teardown();
+    this.sharedColumns.destroy();
   }
 
   /** Attach the stage to a host element (overlay mount root or embedded panel). */
@@ -406,27 +411,58 @@ export class Stage {
     return this.loaded.find((entry) => entry.characterId === characterId);
   }
 
+  /** Characters with a model in the library, by character. */
+  private boundCharacters(settings: SpineSettings): Map<string, ModelRecord> {
+    const bound = new Map<string, ModelRecord>();
+    if (!settings.global.enabled) return bound;
+    for (const [characterId, modelId] of Object.entries(settings.characterModelMapping)) {
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record) bound.set(characterId, record);
+    }
+    return bound;
+  }
+
+  /**
+   * Share which characters have a model here with the other avatar extension,
+   * and take the columns for the chat's members. The render loop reads them
+   * every frame, so a change shows on the next one.
+   */
+  private updateColumns(): void {
+    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
+    const overApp = this.host !== null && this.deps.drawsOverApp();
+    this.sharedColumns.publish(overApp ? own : []);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    if (sameColumns(columns, this.columns)) return;
+    this.columns = columns;
+    this.sortEntries();
+  }
+
+  /** Keep the draw order left to right, whatever order the models finish loading in. */
+  private sortEntries(): void {
+    const column = (entry: LoadedEntry) => this.columns.index.get(entry.characterId) ?? 0;
+    this.loaded.sort((a, b) => column(a) - column(b));
+  }
+
   /** Rebuild the whole stage from current settings + chat context. */
   async reload(): Promise<void> {
     this.teardown(); // bumps loadToken, cancelling any in-flight load
     const token = this.loadToken;
+    // Columns are handed out up front, so a model that loads late (or fails)
+    // doesn't shift the others.
+    this.updateColumns();
 
     const settings = this.deps.getSettings();
     if (!settings.global.enabled || !this.host) return;
-    const cast: Array<{ characterId: string; record: ModelRecord }> = [];
-    for (const characterId of this.characterIds) {
-      const modelId = settings.characterModelMapping[characterId];
-      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
-      if (record) cast.push({ characterId, record });
-    }
+    const bound = this.boundCharacters(settings);
+    const cast = this.characterIds.flatMap((characterId) => {
+      const record = bound.get(characterId);
+      return record ? [{ characterId, record }] : [];
+    });
     if (cast.length === 0) return;
-    // Columns are handed out up front, so a model that loads late (or fails)
-    // doesn't shift the others.
-    this.slotCount = cast.length;
 
     // Each model appears as soon as it's ready; one failing doesn't stop the others.
     await Promise.all(
-      cast.map(async ({ characterId, record }, slot) => {
+      cast.map(async ({ characterId, record }) => {
         let bundle: ModelBundle;
         try {
           bundle = await this.deps.assets.load(record);
@@ -436,7 +472,7 @@ export class Stage {
         }
         if (token !== this.loadToken || !this.host) return;
         try {
-          await this.loadModel(characterId, record, bundle, slot, token);
+          await this.loadModel(characterId, record, bundle, token);
         } catch (error) {
           if (token === this.loadToken) this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
         }
@@ -508,7 +544,6 @@ export class Stage {
     characterId: string,
     record: ModelRecord,
     bundle: ModelBundle,
-    slot: number,
     token: number,
   ): Promise<void> {
     const host = this.host!;
@@ -590,12 +625,10 @@ export class Stage {
       talkTimer: null,
       starterTimer: null,
       thumbnailTimer: null,
-      slot,
     };
     // Owned by the stage from here on, so teardown frees it on any later failure.
-    // Keep the draw order left to right whatever order the models finish loading in.
     this.loaded.push(entry);
-    this.loaded.sort((a, b) => a.slot - b.slot);
+    this.sortEntries();
     this.applySkinTo(entry, modelSettings);
     this.startIdle(entry, modelSettings);
     entry.bounds = measureReferenceBounds(data, modelSettings);
@@ -802,8 +835,8 @@ export class Stage {
 
   /** The model's column for this stage size. */
   private slotOf(entry: LoadedEntry, width: number, height: number): Slot {
-    const slotWidth = width / Math.max(1, this.slotCount);
-    return { x: slotWidth * entry.slot, width: slotWidth, height };
+    const slotWidth = width / Math.max(1, this.columns.count);
+    return { x: slotWidth * (this.columns.index.get(entry.characterId) ?? 0), width: slotWidth, height };
   }
 
   /** The skeleton -> host-pixel transform for the current settings and stage size. */
@@ -1147,7 +1180,6 @@ export class Stage {
     }
     const entries = this.loaded;
     this.loaded = [];
-    this.slotCount = 1;
     for (const entry of entries) {
       if (entry.talkTimer !== null) window.clearTimeout(entry.talkTimer);
       if (entry.starterTimer !== null) window.clearTimeout(entry.starterTimer);

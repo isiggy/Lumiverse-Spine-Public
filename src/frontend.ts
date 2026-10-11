@@ -107,6 +107,7 @@ export function setup(ctx: SpindleFrontendContext) {
     getModelRecord: (modelId) => models.find((model) => model.id === modelId),
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
+    drawsOverApp: () => overlayActive,
     layoutChanged: () => ui.layoutChanged(),
     assets,
     sendInteraction: (message, characterId) => {
