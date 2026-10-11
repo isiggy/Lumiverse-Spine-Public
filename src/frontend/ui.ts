@@ -5,10 +5,13 @@
  * mappings.
  */
 
+import type { SpindleSelectHandle, SpindleSelectOptionLeading, SpindleSelectOptions } from 'lumiverse-spindle-types';
 import type { Stage } from './stage';
 import {
   CLASSIFY_EXPRESSIONS,
   SETTINGS_LIMITS,
+  type LibrarySort,
+  type LibraryView,
   type ModelDescription,
   type ModelRecord,
   type ModelSettings,
@@ -38,6 +41,14 @@ export interface UIController {
   usingOverlay(): boolean;
   /** Re-apply the chat-background stacking after the setting changes. */
   applyBackgroundMode(): void;
+  /** Mount Lumiverse's own searchable dropdown; undefined when the host doesn't offer it. */
+  mountSelect?(target: HTMLElement, options: SpindleSelectOptions): SpindleSelectHandle;
+  /** Save a character's settings for its model to a file. */
+  exportModelSettings(characterId: string, characterName: string): void;
+  /** Load a settings file onto a character; resolves to a status line ('' when cancelled). */
+  importModelSettings(characterId: string, characterName: string): Promise<string>;
+  /** Retake the library thumbnail of a character's model on stage; false when it isn't shown. */
+  updateThumbnail(characterId: string, modelId: string): boolean;
 }
 
 const REQUIRED_PERMS: Array<{ id: string; why: string }> = [
@@ -167,6 +178,76 @@ function note(text: string): HTMLParagraphElement {
   return el('p', 'spn-note', text);
 }
 
+// ── model library helpers ───────────────────────────────────────────────────
+
+const SORT_OPTIONS: Array<{ value: LibrarySort; label: string }> = [
+  { value: 'name', label: 'Name (A–Z)' },
+  { value: 'name_desc', label: 'Name (Z–A)' },
+  { value: 'newest', label: 'Newest first' },
+  { value: 'oldest', label: 'Oldest first' },
+  { value: 'largest', label: 'Largest first' },
+  { value: 'smallest', label: 'Smallest first' },
+];
+
+/** Dropdowns show their search field once they have more options than this. */
+const SEARCH_THRESHOLD = 6;
+
+const byName = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+function sortModels(models: ModelRecord[], sort: LibrarySort): ModelRecord[] {
+  const time = (model: ModelRecord) => Date.parse(model.importedAt) || 0;
+  const compare: Record<LibrarySort, (a: ModelRecord, b: ModelRecord) => number> = {
+    name: (a, b) => byName.compare(a.name, b.name),
+    name_desc: (a, b) => byName.compare(b.name, a.name),
+    newest: (a, b) => time(b) - time(a),
+    oldest: (a, b) => time(a) - time(b),
+    largest: (a, b) => b.sizeBytes - a.sizeBytes,
+    smallest: (a, b) => a.sizeBytes - b.sizeBytes,
+  };
+  const order = compare[sort] ?? compare.name;
+  return [...models].sort((a, b) => order(a, b) || byName.compare(a.name, b.name));
+}
+
+function libraryView(view: LibraryView | undefined): LibraryView {
+  return view === 'list' ? 'list' : 'tiles';
+}
+
+function megabytes(model: ModelRecord): string {
+  return `${(model.sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function modelSummary(model: ModelRecord): string {
+  return `Spine ${model.spineVersion} · ${megabytes(model)}`;
+}
+
+function initial(name: string): string {
+  return (name.trim()[0] ?? '?').toUpperCase();
+}
+
+/** The model's thumbnail, or its initial on a plain square until it has one. */
+function thumbnail(model: ModelRecord, className: string): HTMLElement {
+  if (model.thumbnail) {
+    const image = el('img', className);
+    image.src = model.thumbnail;
+    image.alt = '';
+    return image;
+  }
+  return el('div', `${className} spn-thumb-empty`, initial(model.name));
+}
+
+function modelLeading(model: ModelRecord): SpindleSelectOptionLeading {
+  return model.thumbnail
+    ? { type: 'image', src: model.thumbnail, rounded: false, fallback: { text: initial(model.name) } }
+    : { type: 'initial', text: initial(model.name) };
+}
+
+interface PickerOption {
+  value: string;
+  label: string;
+  sublabel?: string;
+  leading?: SpindleSelectOptionLeading;
+}
+
 function withLabel<T extends HTMLElement>(node: T, label: string): T {
   node.setAttribute('aria-label', label);
   return node;
@@ -208,6 +289,15 @@ export class SettingsUI {
   private renderGeneration = 0;
   /** Refreshes the layout sliders from the stored settings (after a drag on the stage). */
   private syncLayout: (() => void) | null = null;
+  /** Model library filter text (not saved). */
+  private libraryFilter = '';
+  private libraryList: HTMLElement | null = null;
+  /** Result of the last settings file import, shown until another character is picked. */
+  private fileStatusText = '';
+  /** Host dropdowns mounted by the last render, destroyed on the next one. */
+  private mounted: SpindleSelectHandle[] = [];
+  /** Host dropdowns to mount once the render has put their placeholders in the tab. */
+  private pendingMounts: Array<() => void> = [];
 
   constructor(private controller: UIController) {}
 
@@ -225,6 +315,14 @@ export class SettingsUI {
   render(): void {
     const root = this.root;
     if (!root) return;
+    for (const handle of this.mounted.splice(0)) {
+      try {
+        handle.destroy();
+      } catch {
+        /* already gone */
+      }
+    }
+    this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add('spn-root');
     this.syncLayout = null;
@@ -311,23 +409,52 @@ export class SettingsUI {
     }
 
     // ── Model library ──
-    const library = el('div');
     const models = controller.getModels();
+    const library = el('div');
+    const libraryList = el('div');
+    this.libraryList = libraryList;
     if (models.length === 0) {
       library.appendChild(note('No models imported yet. Import a Spine model folder as a .zip archive.'));
-    }
-    for (const model of models) {
-      const megabytes = (model.sizeBytes / (1024 * 1024)).toFixed(1);
-      library.appendChild(
-        row(
-          el('span', 'spn-model-name', model.name),
-          el('span', 'spn-dim', `Spine ${model.spineVersion} · ${model.fileCount} files · ${megabytes} MB`),
-          button('Delete', () => {
-            void controller.deleteModel(model.id);
-          }),
-        ),
+    } else {
+      const filter = withLabel(el('input', 'spn-input spn-library-filter'), 'Filter models');
+      filter.type = 'search';
+      filter.placeholder = 'Filter models…';
+      filter.value = this.libraryFilter;
+      filter.addEventListener('input', () => {
+        this.libraryFilter = filter.value;
+        this.renderLibraryList(libraryList);
+      });
+      const sort = withLabel(
+        select(SORT_OPTIONS, globals.librarySort, (value) => {
+          globals.librarySort = value as LibrarySort;
+          controller.saveDebounced();
+          this.renderLibraryList(libraryList);
+        }),
+        'Sort models',
       );
+      const views = el('div', 'spn-segmented');
+      views.setAttribute('role', 'group');
+      views.setAttribute('aria-label', 'Library view');
+      const viewButtons = (['tiles', 'list'] as const).map((view) => {
+        const viewButton = button(view === 'tiles' ? 'Tiles' : 'List', () => {
+          globals.libraryView = view;
+          controller.saveDebounced();
+          for (const other of viewButtons) {
+            other.classList.toggle('spn-active', other === viewButton);
+            other.setAttribute('aria-pressed', String(other === viewButton));
+          }
+          this.renderLibraryList(libraryList);
+        });
+        const active = libraryView(globals.libraryView) === view;
+        viewButton.classList.toggle('spn-active', active);
+        viewButton.setAttribute('aria-pressed', String(active));
+        views.appendChild(viewButton);
+        return viewButton;
+      });
+      library.appendChild(row(filter, sort, views));
     }
+    library.appendChild(libraryList);
+    this.renderLibraryList(libraryList);
     const importStatus = el('span', 'spn-dim', '');
     library.appendChild(
       row(
@@ -342,7 +469,7 @@ export class SettingsUI {
     library.appendChild(
       note(
         'Zip the exported model folder: the skeleton (.skel or .json), its .atlas and the atlas page images. ' +
-          'Spine 4.1 exports are supported.',
+          "Spine 4.1 exports are supported. A model's thumbnail is taken the first time it's shown.",
       ),
     );
     root.appendChild(section('Model library', library));
@@ -381,23 +508,35 @@ export class SettingsUI {
         note('Open a chat (or grant the "characters" permission) to assign a model to a character.'),
       );
     } else {
-      const characterSelect = select(
-        characters.map((character) => ({ value: character.id, label: character.name })),
+      const characterSelect = this.picker(
+        characters.map((character) => ({
+          value: character.id,
+          label: character.name,
+          leading: {
+            type: 'image',
+            src: `/api/v1/characters/${encodeURIComponent(character.id)}/avatar?size=sm`,
+            fallback: { text: initial(character.name) },
+          },
+        })),
         this.selectedCharacterId ?? characters[0]!.id,
         (value) => {
           this.selectedCharacterId = value;
+          this.fileStatusText = '';
           this.render();
         },
+        { label: 'Character', placeholder: 'Choose a character', searchPlaceholder: 'Search characters…' },
       );
       const boundModelId = this.selectedCharacterId
         ? settings.characterModelMapping[this.selectedCharacterId] ?? 'none'
         : 'none';
       this.selectedModelId = boundModelId === 'none' ? null : boundModelId;
-      const modelSelect = select(
-        [
-          { value: 'none', label: 'No model' },
-          ...models.map((model) => ({ value: model.id, label: model.name })),
-        ],
+      const modelSelect = this.picker(
+        sortModels(models, globals.librarySort).map((model) => ({
+          value: model.id,
+          label: model.name,
+          sublabel: modelSummary(model),
+          leading: modelLeading(model),
+        })),
         boundModelId,
         (value) => {
           const characterId = this.selectedCharacterId;
@@ -408,6 +547,7 @@ export class SettingsUI {
           if (this.isOnStage(characterId)) controller.reloadStage();
           this.render();
         },
+        { label: 'Model', placeholder: 'No model', searchPlaceholder: 'Search models…', noneLabel: 'No model' },
       );
       bindingSection.appendChild(row('Character', characterSelect));
       bindingSection.appendChild(row('Model', modelSelect));
@@ -419,6 +559,31 @@ export class SettingsUI {
           ),
         );
       }
+      const characterName = () =>
+        characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, '') ??
+        'Character';
+      const fileStatus = el('span', 'spn-dim', this.fileStatusText);
+      fileStatus.setAttribute('role', 'status');
+      const exportButton = button('Export settings', () => {
+        if (this.selectedCharacterId) controller.exportModelSettings(this.selectedCharacterId, characterName());
+      });
+      exportButton.disabled = boundModelId === 'none';
+      exportButton.title = 'Save this character’s model and animation settings to a file';
+      const importButton = button('Import settings', () => {
+        const characterId = this.selectedCharacterId;
+        if (!characterId) return;
+        fileStatus.textContent = '';
+        void controller
+          .importModelSettings(characterId, characterName())
+          .catch((error) => `Import failed: ${String(error)}`)
+          .then((status) => {
+            if (this.selectedCharacterId !== characterId) return;
+            this.fileStatusText = status;
+            this.render();
+          });
+      });
+      importButton.title = 'Load model and animation settings for this character from a file';
+      bindingSection.appendChild(row(exportButton, importButton, fileStatus));
       bindingSection.appendChild(
         row(
           button('Clear model settings for this character', () => {
@@ -495,6 +660,114 @@ export class SettingsUI {
     );
     test.open = false;
     root.appendChild(test);
+
+    for (const mount of this.pendingMounts.splice(0)) mount();
+  }
+
+  /** Redraw the model library (after a thumbnail changes) without rebuilding the rest of the tab. */
+  refreshLibrary(): void {
+    if (this.libraryList) this.renderLibraryList(this.libraryList);
+  }
+
+  /** The library's models, filtered and sorted, as tiles or a list. */
+  private renderLibraryList(host: HTMLElement): void {
+    const controller = this.controller;
+    const settings = controller.getSettings();
+    const models = controller.getModels();
+    host.replaceChildren();
+    if (models.length === 0) return;
+    const needle = this.libraryFilter.trim().toLowerCase();
+    const shown = sortModels(
+      needle ? models.filter((model) => model.name.toLowerCase().includes(needle)) : models,
+      settings.global.librarySort,
+    );
+    if (shown.length === 0) {
+      host.appendChild(note(`No models match “${this.libraryFilter.trim()}”.`));
+      return;
+    }
+    const boundTo = (modelId: string) =>
+      Object.values(settings.characterModelMapping).filter((bound) => bound === modelId).length;
+    const remove = (model: ModelRecord, label: string) => {
+      const removeButton = withLabel(
+        button(label, () => {
+          void controller.deleteModel(model.id);
+        }),
+        `Delete ${model.name}`,
+      );
+      removeButton.title = `Delete ${model.name}`;
+      return removeButton;
+    };
+
+    if (libraryView(settings.global.libraryView) === 'tiles') {
+      const grid = el('div', 'spn-tiles');
+      for (const model of shown) {
+        const tile = el('div', 'spn-tile');
+        const used = boundTo(model.id);
+        tile.title = `${model.name}\n${modelSummary(model)}${used ? `\nUsed by ${used} character${used === 1 ? '' : 's'}` : ''}`;
+        tile.appendChild(thumbnail(model, 'spn-tile-thumb'));
+        tile.appendChild(el('div', 'spn-tile-name', model.name));
+        tile.appendChild(el('div', 'spn-tile-meta', megabytes(model)));
+        const removeButton = remove(model, '✕');
+        removeButton.classList.add('spn-tile-delete');
+        tile.appendChild(removeButton);
+        grid.appendChild(tile);
+      }
+      host.appendChild(grid);
+      return;
+    }
+    for (const model of shown) {
+      const line = el('div', 'spn-list-row');
+      const text = el('div', 'spn-list-text');
+      text.appendChild(el('div', 'spn-model-name', model.name));
+      text.appendChild(el('div', 'spn-dim', `Spine ${model.spineVersion} · ${model.fileCount} files · ${megabytes(model)}`));
+      line.append(thumbnail(model, 'spn-list-thumb'), text, remove(model, 'Delete'));
+      host.appendChild(line);
+    }
+  }
+
+  /**
+   * A dropdown with a search field. Uses Lumiverse's own dropdown, mounted once
+   * the render has placed it in the tab, and a plain select where that's unavailable.
+   * A `noneLabel` adds a first option whose value is 'none'.
+   */
+  private picker(
+    options: PickerOption[],
+    value: string,
+    onChange: (value: string) => void,
+    config: { label: string; placeholder: string; searchPlaceholder: string; noneLabel?: string },
+  ): HTMLElement {
+    const fallback = () =>
+      select(
+        [...(config.noneLabel ? [{ value: 'none', label: config.noneLabel }] : []), ...options],
+        value,
+        onChange,
+      );
+    const mount = this.controller.mountSelect;
+    if (!mount) return fallback();
+    const host = el('div', 'spn-picker');
+    this.pendingMounts.push(() => {
+      try {
+        this.mounted.push(
+          mount(host, {
+            options,
+            value: value === 'none' ? '' : value,
+            clearable: config.noneLabel !== undefined,
+            clearLabel: config.noneLabel,
+            placeholder: config.placeholder,
+            searchPlaceholder: config.searchPlaceholder,
+            noResultsMessage: 'No matches',
+            searchThreshold: SEARCH_THRESHOLD,
+            maxHeight: 360,
+            ariaLabel: config.label,
+            onChange: (next) => onChange(next === '' ? 'none' : next),
+          }),
+        );
+      } catch (error) {
+        console.debug('[spine] host dropdown unavailable:', error);
+        host.replaceChildren(withLabel(fallback(), config.label));
+      }
+    });
+    return host;
   }
 
   /** Whether this character is in the chat on stage (its binding changes show there). */
@@ -581,6 +854,15 @@ export class SettingsUI {
           viewStatus.say('');
           this.syncLayout?.();
         }),
+        button('Update thumbnail', () =>
+          onStage(viewStatus, () => {
+            viewStatus.say(
+              controller.updateThumbnail(characterId, modelId)
+                ? 'Thumbnail updated.'
+                : 'The stage is hidden or has no size yet. Show it, then try again.',
+            );
+          }),
+        ),
         viewStatus.root,
       ),
     );
@@ -755,5 +1037,26 @@ export const UI_CSS = `
 .spn-banner { border: 1px solid var(--lumiverse-accent); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
 .spn-banner-title { font-weight: 600; margin-bottom: 4px; }
 .spn-banner-line { color: var(--lumiverse-text-muted); font-size: 12px; margin: 2px 0 6px; }
+.spn-segmented { display: inline-flex; }
+.spn-segmented .spn-btn { border-radius: 0; }
+.spn-segmented .spn-btn:first-child { border-radius: var(--lumiverse-radius) 0 0 var(--lumiverse-radius); }
+.spn-segmented .spn-btn:last-child { border-radius: 0 var(--lumiverse-radius) var(--lumiverse-radius) 0; margin-left: -1px; }
+.spn-btn.spn-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-accent); }
+.spn-btn:disabled { opacity: 0.5; cursor: default; }
+.spn-library-filter { min-width: 140px; }
+.spn-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin: 8px 0; }
+.spn-tile { position: relative; display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 4px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill); }
+.spn-tile-delete { position: absolute; top: 6px; right: 6px; padding: 0 6px !important; font-size: 11px; line-height: 18px; opacity: 0.55; }
+.spn-tile:hover .spn-tile-delete, .spn-tile-delete:focus-visible { opacity: 1; }
+.spn-tile-thumb { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); }
+.spn-tile-name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spn-tile-meta { color: var(--lumiverse-text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spn-list-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.spn-list-text { flex: 1; min-width: 0; }
+.spn-list-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spn-list-thumb { width: 32px; height: 32px; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); flex: none; }
+.spn-thumb-empty { display: flex; align-items: center; justify-content: center; color: var(--lumiverse-text-dim); font-weight: 600; font-size: 20px; }
+.spn-list-thumb.spn-thumb-empty { font-size: 14px; }
+.spn-picker { flex: 1; min-width: 180px; max-width: 360px; }
 .spn-embedded-host { position: relative; width: 100%; height: 420px; overflow: hidden; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); }
 `;

@@ -7,8 +7,9 @@ A Spindle extension for Lumiverse that shows Spine models as character avatars. 
 - `spindle.json`: extension manifest.
 - `src/backend.ts`: runs in a Lumiverse-managed Bun process. Settings and model storage, ZIP import (finds the skeleton and atlas, checks the Spine version), streaming model files to the browser, LLM emotion classification.
 - `src/frontend.ts`: browser entry. Wires the stage, settings tab and backend messages together.
-- `src/frontend/stage.ts`: spine-webgl rendering, layout and model interaction. `ui.ts` is the settings tab, `assets.ts` the model file cache, `tus.ts` the upload client.
-- `src/shared/`: the settings schema and the frontend/backend message types.
+- `src/frontend/stage.ts`: spine-webgl rendering, layout and model interaction. `ui.ts` is the settings tab, `assets.ts` the model file cache, `tus.ts` the upload client, `thumbnail.ts` turns a stage capture into a library thumbnail.
+- `src/shared/`: the settings schema, the frontend/backend message types, and `settings-file.ts`, the export/import file format (shared with the Live2D extension; keep the two copies in step).
+- The Character model dropdowns are Lumiverse's own searchable select (`ctx.components.mountSelect`), mounted after each render into placeholders and destroyed on the next; e2e drives them by clicking the trigger and the `[role="option"]` rows.
 - `dist/` is committed, because Lumiverse installs straight from the repo. Rebuild before committing source changes.
 
 The Spine runtime is the npm package `@esotericsoftware/spine-webgl`, pinned to 4.1.x and bundled into `dist/frontend.js`. Each Spine editor version has its own binary format, so the runtime's major.minor must match `SUPPORTED_SPINE_VERSION` in `src/shared/settings.ts`, which the import check uses.
@@ -48,6 +49,7 @@ scripts/dev/lumiverse.sh e2e      # headless: create a chat, import and bind spi
 - `e2e --model path/to/model.zip` tests a specific model instead of spineboy. The extension names an imported model after its zip file, so `e2e` finds it by that name and imports it only if it isn't in the library yet.
 - `e2e --group` tests a three-member group chat (`seed-group` creates it): each member's model in its own column, a drag and a talking message reaching only the right model, and the stage re-laying out when a member leaves and comes back. Repeat `--model` to give members different models in turn.
 - `e2e --controls` then drives every control in the Model settings tab (fit, zoom, rotation, fit while rotated, center, render scale, playback speed, premultiplied alpha, persistence across a reload), checks each one's effect on the drawn model, and saves a `control-*.png` screenshot for each.
+- `e2e --library` then tests the model library (thumbnail, sorting, filter, tiles and list, persistence), search in the model dropdown, and settings file export and import. It imports six copies of the model zip under other names, so the dropdown has enough options to show its search field.
 - `e2e --slow` sends the browser's traffic through a 3 MB/s proxy (`scripts/dev/throttle-proxy.mjs`), like a remote user. Use it for anything that touches model downloads.
 
 Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and chat only), `models` (downloads spineboy, a Spine 4.1 example, to `$LUMI_WORK/models/`). `export` the variable rather than prefixing one command, since every command reads it.

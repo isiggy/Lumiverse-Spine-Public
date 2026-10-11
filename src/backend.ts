@@ -19,6 +19,7 @@ import type {
   ImportModelZipMsg,
   InteractionMsg,
   SaveSettingsMsg,
+  SaveThumbnailMsg,
 } from './shared/protocol';
 import {
   CLASSIFY_EXPRESSIONS,
@@ -408,6 +409,25 @@ async function handleDeleteModel(modelId: string, userId: string): Promise<void>
   send({ type: 'model_deleted', modelId }, userId);
 }
 
+/** Thumbnails are small webp/png pictures; anything bigger than this isn't one. */
+const MAX_THUMBNAIL_CHARS = 512 * 1024;
+
+async function handleSaveThumbnail(msg: SaveThumbnailMsg, userId: string): Promise<void> {
+  if (
+    typeof msg.dataUrl !== 'string' ||
+    msg.dataUrl.length > MAX_THUMBNAIL_CHARS ||
+    !/^data:image\/(webp|png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(msg.dataUrl)
+  ) {
+    return;
+  }
+  const registry = await loadRegistry(userId);
+  const record = registry.find((model) => model.id === msg.modelId);
+  if (!record) return;
+  record.thumbnail = msg.dataUrl;
+  await saveRegistry(registry, userId);
+  send({ type: 'model_updated', model: record }, userId);
+}
+
 // ── Model file streaming ────────────────────────────────────────────────────
 
 function toBase64(bytes: Uint8Array): string {
@@ -719,6 +739,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
         break;
       case 'delete_model':
         await handleDeleteModel(msg.modelId, userId);
+        break;
+      case 'save_thumbnail':
+        await handleSaveThumbnail(msg, userId);
         break;
       case 'get_model_manifest':
         await handleGetModelManifest(msg, userId);
