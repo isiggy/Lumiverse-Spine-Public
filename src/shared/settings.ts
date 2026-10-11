@@ -125,7 +125,13 @@ export interface GlobalSettings {
    * - 'off'    — no automatic animation on messages
    */
   expressionSource: 'llm' | 'native' | 'off';
+  /** Model library order and layout in the settings tab. */
+  librarySort: LibrarySort;
+  libraryView: LibraryView;
 }
+
+export type LibrarySort = 'name' | 'name_desc' | 'newest' | 'oldest' | 'largest' | 'smallest';
+export type LibraryView = 'tiles' | 'list';
 
 export interface SpineSettings {
   global: GlobalSettings;
@@ -151,6 +157,8 @@ export interface ModelRecord {
   importedAt: string;
   /** bumped when files change; used for frontend cache invalidation */
   version: number;
+  /** Small picture of the model for the library (an image data URL), taken the first time it's shown. */
+  thumbnail?: string;
 }
 
 /** What the settings UI needs to know about a model's skeleton. */
@@ -175,6 +183,8 @@ export function defaultGlobalSettings(): GlobalSettings {
     backgroundMode: false,
     showBounds: false,
     expressionSource: 'llm',
+    librarySort: 'name',
+    libraryView: 'tiles',
   };
 }
 
@@ -291,4 +301,23 @@ export function ensureModelSettingsShape(
   settings.talk_time_per_character = clampNumber(settings.talk_time_per_character, 0, 1000, 30);
   settings.animation_starter.delay = clampNumber(settings.animation_starter.delay, 0, 60_000, 0);
   return settings;
+}
+
+/**
+ * Per-model settings from an untrusted source (an imported file): only the
+ * known fields, with wrong types replaced by defaults and numbers clamped.
+ */
+export function sanitizeModelSettings(raw: unknown, description: ModelDescription | null = null): ModelSettings {
+  const base = defaultModelSettings(description) as unknown as Record<string, unknown>;
+  const source = isPlainObject(raw) ? raw : {};
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(base)) {
+    if (source[key] !== undefined) out[key] = structuredClone(source[key]);
+  }
+  for (const nested of ['animation_starter', 'animation_click', 'classify_mapping'] as const) {
+    if (!isPlainObject(out[nested])) continue;
+    const known = base[nested] as Record<string, unknown>;
+    out[nested] = Object.fromEntries(Object.entries(out[nested]).filter(([key]) => key in known));
+  }
+  return ensureModelSettingsShape(out as unknown as ModelSettings, description);
 }

@@ -14,6 +14,8 @@
 //   lumiverse.sh e2e --group      # a three-member group chat: every member's model is drawn in its
 //                                 # own column, drags and talking reach the right model, and
 //                                 # removing a member re-lays the stage out
+//   lumiverse.sh e2e --library    # also test the model library (thumbnails, sorting, filter, tiles
+//                                 # and list), dropdown search, and settings file export/import
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -27,6 +29,7 @@ const OUT = process.env.LUMI_OUT;
 const keepOpen = process.argv.includes('--keep-open');
 const controls = process.argv.includes('--controls');
 const group = process.argv.includes('--group');
+const testLibrary = process.argv.includes('--library');
 const MODEL_ZIPS = (process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP).split('\n').filter(Boolean);
 const GROUP_CHAT = `${BASE}/chat/${process.env.LUMI_GROUP_CHAT_ID}`;
 const GROUP_MEMBERS = (process.env.LUMI_GROUP_MEMBERS || '').split('\n').filter(Boolean);
@@ -383,7 +386,7 @@ const modelName = (zip) => path.basename(zip).replace(/\.zip$/i, '');
 async function importModel(zip) {
   const name = modelName(zip);
   const inLibrary = (name) =>
-    [...document.querySelectorAll('.spn-model-name')].some((node) => node.textContent === name);
+    [...document.querySelectorAll('.spn-model-name, .spn-tile-name')].some((node) => node.textContent === name);
   if (await page.evaluate(inLibrary, name)) return;
   console.log(`Importing ${name}…`);
   const [chooser] = await Promise.all([
@@ -394,38 +397,236 @@ async function importModel(zip) {
   await page.waitForFunction(inLibrary, name, { timeout: 300000 });
 }
 
+/** The Character model section's dropdowns (Lumiverse's own): [character, model]. */
+function bindingPickers() {
+  return page.locator('.spn-section:has(> .spn-section-title:text-is("Character model")) .spn-picker');
+}
+
+/** An option's label: its first line that isn't a one-letter initial. */
+function optionLabel(text) {
+  return text.split('\n').map((line) => line.trim()).find((line) => line.length > 1) ?? '';
+}
+
+/** Open a dropdown and list its options' labels. */
+async function pickerOptions(picker) {
+  await picker.locator('button').first().click();
+  await page.waitForSelector('[role="listbox"]');
+  const labels = (await page.locator('[role="listbox"] [role="option"]').allInnerTexts()).map(optionLabel);
+  await page.keyboard.press('Escape');
+  return labels;
+}
+
+/** Choose the option whose label is one of `labels`, searching first when the dropdown has a search field. */
+async function pick(picker, labels, searchLabel) {
+  await picker.locator('button').first().click();
+  await page.waitForSelector('[role="listbox"]');
+  const search = page.locator(`input[aria-label="${searchLabel}"]`);
+  if (await search.isVisible().catch(() => false)) await search.fill(labels[0]);
+  const options = (await page.locator('[role="listbox"] [role="option"]').allInnerTexts()).map(optionLabel);
+  const index = options.findIndex((option) => labels.includes(option));
+  if (index === -1) {
+    await page.keyboard.press('Escape');
+    throw new Error(`${labels[0]} missing from the dropdown (${options.join(', ')})`);
+  }
+  await page.locator('[role="listbox"] [role="option"]').nth(index).click();
+}
+
 /** Pick a character in the Character model section; returns its option label. */
 async function selectCharacter(characterId) {
-  const label = await page.evaluate((characterId) => {
-    const section = [...document.querySelectorAll('.spn-section')].find(
-      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
-    );
-    const select = section?.querySelector('select');
-    if (!select) throw new Error('No character select');
-    if (select.value !== characterId) {
-      select.value = characterId;
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    return select.selectedOptions[0]?.textContent;
-  }, characterId);
+  const name = await page.evaluate(
+    (id) => fetch(`/api/v1/characters/${id}`).then((response) => response.json()).then((c) => c.name),
+    characterId,
+  );
+  const labels = [name, `${name} (in this chat)`];
+  const picker = bindingPickers().nth(0);
+  const current = optionLabel(await picker.innerText());
+  if (!labels.includes(current)) await pick(picker, labels, 'Search characters…');
   await page.waitForTimeout(300);
-  return label;
+  return optionLabel(await bindingPickers().nth(0).innerText());
 }
 
 async function bindModel(name) {
-  await page.evaluate((name) => {
-    const section = [...document.querySelectorAll('.spn-section')].find(
-      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
-    );
-    const modelSelect = section.querySelectorAll('select')[1];
-    const option = [...modelSelect.options].find((o) => o.textContent === name);
-    if (!option) throw new Error(`${name} missing from the model list`);
-    if (modelSelect.value !== option.value) {
-      modelSelect.value = option.value;
-      modelSelect.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-  }, name);
+  const picker = bindingPickers().nth(1);
+  if (optionLabel(await picker.innerText()) !== name) await pick(picker, [name], 'Search models…');
   await page.waitForTimeout(500);
+}
+
+/** Names of the models in the library, in the order shown (tiles or list). */
+function libraryNames() {
+  return page.evaluate(() =>
+    [...document.querySelectorAll('.spn-tile-name, .spn-model-name')].map((node) => node.textContent),
+  );
+}
+
+async function setLibrarySort(label) {
+  await page.locator('.spn-root select[aria-label="Sort models"]').selectOption({ label });
+}
+
+/** Import a settings file through the Character model section; returns the confirm dialog's text, if one opened. */
+async function importSettingsFile(filePath) {
+  const [chooser] = await Promise.all([
+    page.waitForEvent('filechooser', { timeout: 15000 }),
+    page.click('button:has-text("Import settings")'),
+  ]);
+  await chooser.setFiles(filePath);
+  // Lumiverse's confirm modal: the title, then the message, then the buttons.
+  const title = page.locator('h3:has-text("Import model settings")');
+  const opened = await title.waitFor({ timeout: 5000 }).then(() => true, () => false);
+  if (!opened) return null;
+  const text = await title.locator('xpath=..').innerText();
+  await page.locator('button:text-is("Import")').click();
+  await page.waitForTimeout(1500);
+  return text;
+}
+
+function fileStatus() {
+  return page.evaluate(() => {
+    const exportButton = [...document.querySelectorAll('.spn-root button')].find((b) => b.textContent === 'Export settings');
+    return exportButton?.parentElement?.querySelector('[role="status"]')?.textContent ?? '';
+  });
+}
+
+async function runLibrary() {
+  console.log('── Library, dropdown search and settings files ──');
+  await openSpineTab();
+  const hasThumbnail = await page
+    .waitForFunction(
+      (name) =>
+        [...document.querySelectorAll('.spn-tile')].some(
+          (tile) =>
+            tile.querySelector('.spn-tile-name')?.textContent === name &&
+            tile.querySelector('img')?.src.startsWith('data:image/'),
+        ),
+      MODEL_NAME,
+      { timeout: 15000 },
+    )
+    .then(() => true, () => false);
+  check(hasThumbnail, `${MODEL_NAME} has a thumbnail in the tile view`);
+
+  // Enough models for the dropdown to offer a search field.
+  const extra = ['Aurora', 'Beryl', 'Cobalt', 'Dahlia', 'Ember', 'Fern'];
+  const copies = path.join(OUT, 'library-copies');
+  fs.mkdirSync(copies, { recursive: true });
+  for (const name of extra) {
+    const zip = path.join(copies, `${name}.zip`);
+    fs.copyFileSync(process.env.LUMI_MODEL_ZIP, zip);
+    await importModel(zip);
+  }
+  const librarySection = page.locator('.spn-section:has(> .spn-section-title:text-is("Model library"))');
+  await librarySection.screenshot({ path: `${OUT}/library-tiles.png` });
+
+  await setLibrarySort('Name (Z–A)');
+  let names = await libraryNames();
+  check(names[0] === [...names].sort((a, b) => b.localeCompare(a))[0], `Name (Z–A) puts ${names[0]} first`);
+  await setLibrarySort('Oldest first');
+  const oldest = await libraryNames();
+  await setLibrarySort('Newest first');
+  names = await libraryNames();
+  check(
+    names.join() === [...oldest].reverse().join() && names.indexOf('Fern') < names.indexOf('Aurora'),
+    `Newest first is Oldest first reversed, Fern before Aurora (${names.join(', ')})`,
+  );
+  await setLibrarySort('Name (A–Z)');
+  names = await libraryNames();
+  check(names[0] === 'Aurora', `Name (A–Z) puts ${names[0]} first`);
+
+  await page.fill('.spn-library-filter', 'er');
+  names = await libraryNames();
+  check(names.join() === 'Beryl,Ember,Fern', `filter "er" shows ${names.join(', ')}`);
+  await librarySection.screenshot({ path: `${OUT}/library-filter.png` });
+  await page.fill('.spn-library-filter', '');
+
+  const tileCount = await page.locator('.spn-tile').count();
+  await page.click('.spn-segmented button:text-is("List")');
+  const listRows = await page.locator('.spn-list-thumb').count();
+  check(
+    listRows === tileCount && (await page.locator('.spn-tile').count()) === 0,
+    `list view shows ${listRows} rows for ${tileCount} tiles`,
+  );
+  await librarySection.screenshot({ path: `${OUT}/library-list.png` });
+  await page.click('.spn-segmented button:text-is("Tiles")');
+
+  // Search in the model dropdown.
+  const modelPicker = bindingPickers().nth(1);
+  await modelPicker.scrollIntoViewIfNeeded();
+  await modelPicker.locator('button').first().click();
+  const search = page.locator('input[aria-label="Search models…"]');
+  check(await search.isVisible().catch(() => false), 'model dropdown has a search field');
+  await search.fill('cob');
+  const options = (await page.locator('[role="listbox"] [role="option"]').allInnerTexts())
+    .map(optionLabel)
+    .filter((label) => label !== 'No model');
+  check(options.join() === 'Cobalt', `searching "cob" leaves ${options.join(', ')}`);
+  await page.screenshot({ path: `${OUT}/model-search.png` });
+  await page.keyboard.press('Escape');
+
+  // Export this character's settings, change them, and import the file back.
+  await waitForModelSettings();
+  await setSlider('Zoom', 0.8);
+  await setSlider('Rotation', 15);
+  await page.waitForTimeout(800);
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: 10000 }),
+    page.click('button:has-text("Export settings")'),
+  ]);
+  const exported = path.join(OUT, download.suggestedFilename());
+  await download.saveAs(exported);
+  const file = JSON.parse(fs.readFileSync(exported, 'utf8'));
+  check(
+    file.format === 'lumiverse-avatar-model-settings' &&
+      file.extension === 'spine' &&
+      file.model.name === MODEL_NAME &&
+      file.settings.zoom === 0.8 &&
+      file.settings.rotation === 15,
+    `exported ${download.suggestedFilename()} (zoom ${file.settings?.zoom}, rotation ${file.settings?.rotation})`,
+  );
+
+  await setSlider('Zoom', 1.3);
+  await setSlider('Rotation', 0);
+  const dialog = await importSettingsFile(exported);
+  check(dialog?.includes(MODEL_NAME), 'import asks before replacing the settings');
+  await waitForModelSettings();
+  check((await sliderValue('Zoom')) === 0.8 && (await sliderValue('Rotation')) === 15, 'import restored zoom 0.8 and rotation 15');
+  check((await fileStatus()).startsWith('Imported'), `status: ${await fileStatus()}`);
+
+  // A file for a model that isn't in the library applies to the bound model after a warning.
+  const missing = path.join(OUT, 'missing-model.spine-settings.json');
+  fs.writeFileSync(
+    missing,
+    JSON.stringify({ ...file, model: { id: 'not_here', name: 'Not Here' }, settings: { ...file.settings, zoom: 0.5, speed: 'fast' } }),
+  );
+  const warning = await importSettingsFile(missing);
+  check(warning?.includes("isn't in your library"), 'a file for a missing model warns before applying');
+  await waitForModelSettings();
+  check((await sliderValue('Zoom')) === 0.5 && (await sliderValue('Playback speed')) === 1, 'it applied zoom 0.5 and ignored the bad speed value');
+  await page.screenshot({ path: `${OUT}/import-applied.png` });
+
+  // A Live2D settings file is refused with a message.
+  const live2d = path.join(OUT, 'live2d.json');
+  fs.writeFileSync(live2d, JSON.stringify({ ...file, extension: 'live2d' }));
+  check((await importSettingsFile(live2d)) === null, 'a Live2D file opens no dialog');
+  await page.waitForTimeout(500);
+  check((await fileStatus()).includes('Live2D Avatars extension'), `status: ${await fileStatus()}`);
+
+  // Sort and view persist.
+  await setLibrarySort('Largest first');
+  await page.click('.spn-segmented button:text-is("List")');
+  await page.waitForTimeout(1000);
+  await page.goto(CHAT);
+  await page.waitForTimeout(5000);
+  await openSpineTab();
+  const kept = await page.evaluate(() => ({
+    sort: document.querySelector('.spn-root select[aria-label="Sort models"]')?.value,
+    list: document.querySelectorAll('.spn-list-thumb').length,
+  }));
+  check(kept.sort === 'largest' && kept.list > 0, `sort and view kept after a reload (${JSON.stringify(kept)})`);
+  await page.click('.spn-segmented button:text-is("Tiles")');
+  await setLibrarySort('Name (A–Z)');
+  await waitForModelSettings();
+  await clickButton('Fit to canvas');
+  await setSlider('Rotation', 0);
+  await clickButton('Fit to canvas');
+  await page.waitForTimeout(1000);
 }
 
 async function selectByLabel(label, value) {
@@ -550,12 +751,7 @@ async function runGroup() {
     await bindModel(names[index % names.length]);
     console.log(`bound ${names[index % names.length]} to ${label}`);
   }
-  const labels = await page.evaluate(() => {
-    const section = [...document.querySelectorAll('.spn-section')].find(
-      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
-    );
-    return [...(section?.querySelector('select')?.options ?? [])].map((o) => o.textContent);
-  });
+  const labels = await pickerOptions(bindingPickers().nth(0));
   check(
     labels.slice(0, members.length).every((label) => label.endsWith('(in this chat)')),
     `group members listed first in the character picker: ${labels.slice(0, members.length).join(', ')}`,
@@ -731,7 +927,7 @@ try {
   await openSpineTab();
 
   const inLibrary = (name) =>
-    [...document.querySelectorAll('.spn-model-name')].some((node) => node.textContent === name);
+    [...document.querySelectorAll('.spn-model-name, .spn-tile-name')].some((node) => node.textContent === name);
   if (!(await page.evaluate(inLibrary, MODEL_NAME))) {
     console.log(`Importing ${MODEL_NAME}…`);
     const [chooser] = await Promise.all([
@@ -742,20 +938,14 @@ try {
     await page.waitForFunction(inLibrary, MODEL_NAME, { timeout: 300000 });
   }
 
-  const binding = await page.evaluate((name) => {
-    const section = [...document.querySelectorAll('.spn-section')].find(
-      (node) => node.querySelector('.spn-section-title')?.textContent === 'Character model',
-    );
-    const [characterSelect, modelSelect] = section ? [...section.querySelectorAll('select')] : [];
-    if (!modelSelect) return 'no binding controls (is a chat open?)';
-    const option = [...modelSelect.options].find((o) => o.textContent === name);
-    if (!option) return `${name} missing from the model list`;
-    if (modelSelect.value === option.value) return `already bound: ${name}`;
-    modelSelect.value = option.value;
-    modelSelect.dispatchEvent(new Event('change', { bubbles: true }));
-    return `bound ${name} to ${characterSelect.selectedOptions[0]?.textContent}`;
-  }, MODEL_NAME);
-  console.log(binding);
+  if ((await bindingPickers().count()) < 2) {
+    console.log('no binding controls (is a chat open?)');
+  } else if (optionLabel(await bindingPickers().nth(1).innerText()) === MODEL_NAME) {
+    console.log(`already bound: ${MODEL_NAME}`);
+  } else {
+    await bindModel(MODEL_NAME);
+    console.log(`bound ${MODEL_NAME} to ${optionLabel(await bindingPickers().nth(0).innerText())}`);
+  }
   await page.waitForTimeout(3000);
   if (keepOpen) await page.screenshot({ path: `${OUT}/spine-tab.png` });
 
@@ -782,6 +972,7 @@ try {
   }
 
   if (controls && failures.length === 0) await runControls();
+  if (testLibrary && stage?.drawnFraction > 0) await runLibrary();
 
   console.log(`Screenshots: ${OUT}`);
   for (const problem of problems) console.log(problem);

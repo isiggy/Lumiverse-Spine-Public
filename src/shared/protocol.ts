@@ -25,6 +25,13 @@ export interface DeleteModelMsg {
   modelId: string;
 }
 
+/** Store a library thumbnail for a model (an image data URL of at most ~256×256 pixels). */
+export interface SaveThumbnailMsg {
+  type: 'save_thumbnail';
+  modelId: string;
+  dataUrl: string;
+}
+
 /**
  * Model files are pulled by the browser a few chunks at a time. The host relays
  * extension messages with Bun's pub/sub, which silently drops messages once a
@@ -69,6 +76,7 @@ export type FrontendToBackend =
   | SaveSettingsMsg
   | ImportModelZipMsg
   | DeleteModelMsg
+  | SaveThumbnailMsg
   | GetModelManifestMsg
   | GetModelChunkMsg
   | InteractionMsg
@@ -91,6 +99,12 @@ export interface SettingsSavedMsg {
 
 export interface ModelImportedMsg {
   type: 'model_imported';
+  model: ModelRecord;
+}
+
+/** A model's record changed without its files changing (e.g. a new thumbnail). */
+export interface ModelUpdatedMsg {
+  type: 'model_updated';
   model: ModelRecord;
 }
 
@@ -194,6 +208,7 @@ export type BackendToFrontend =
   | StateMsg
   | SettingsSavedMsg
   | ModelImportedMsg
+  | ModelUpdatedMsg
   | ModelDeletedMsg
   | ImportErrorMsg
   | ModelManifestMsg

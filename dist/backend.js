@@ -2227,7 +2227,9 @@ function defaultGlobalSettings() {
     autoSendInteraction: false,
     backgroundMode: false,
     showBounds: false,
-    expressionSource: "llm"
+    expressionSource: "llm",
+    librarySort: "name",
+    libraryView: "tiles"
   };
 }
 function defaultSettings() {
@@ -2641,6 +2643,19 @@ async function handleDeleteModel(modelId, userId) {
     await saveSettings(settings, userId);
   send({ type: "model_deleted", modelId }, userId);
 }
+var MAX_THUMBNAIL_CHARS = 512 * 1024;
+async function handleSaveThumbnail(msg, userId) {
+  if (typeof msg.dataUrl !== "string" || msg.dataUrl.length > MAX_THUMBNAIL_CHARS || !/^data:image\/(webp|png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(msg.dataUrl)) {
+    return;
+  }
+  const registry = await loadRegistry(userId);
+  const record = registry.find((model) => model.id === msg.modelId);
+  if (!record)
+    return;
+  record.thumbnail = msg.dataUrl;
+  await saveRegistry(registry, userId);
+  send({ type: "model_updated", model: record }, userId);
+}
 function toBase64(bytes) {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
 }
@@ -2872,6 +2887,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
         break;
       case "delete_model":
         await handleDeleteModel(msg.modelId, userId);
+        break;
+      case "save_thumbnail":
+        await handleSaveThumbnail(msg, userId);
         break;
       case "get_model_manifest":
         await handleGetModelManifest(msg, userId);

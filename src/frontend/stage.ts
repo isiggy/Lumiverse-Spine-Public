@@ -21,6 +21,7 @@
 
 import * as spine from '@esotericsoftware/spine-webgl';
 import type { ModelAssets, ModelBundle } from './assets';
+import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
   type ModelDescription,
   type ModelRecord,
@@ -59,6 +60,8 @@ const MAX_DELTA = 0.1;
 const MAX_CANVAS_PIXELS = 4096 * 4096;
 /** How long to wait for a lost WebGL context to come back before rebuilding the stage. */
 const CONTEXT_RESTORE_WAIT_MS = 3000;
+/** How long a model has been on stage before its first thumbnail is taken (its idle pose has settled). */
+const THUMBNAIL_DELAY_MS = 1500;
 
 // The canvas is transparent and composited over the app. Additive slots (glows)
 // must not add alpha, or they'd darken the page behind them instead of
@@ -78,6 +81,8 @@ export interface StageDeps {
   assets: ModelAssets;
   /** Send a click interaction message into the chat, from a click on this character's model. */
   sendInteraction(message: string, characterId: string): void;
+  /** Store a model's library thumbnail (an image data URL). */
+  saveThumbnail(modelId: string, dataUrl: string): void;
   log(message: string): void;
 }
 
@@ -116,6 +121,7 @@ interface LoadedEntry {
   textures: spine.GLTexture[];
   talkTimer: number | null;
   starterTimer: number | null;
+  thumbnailTimer: number | null;
   /** Column on the stage, counted from the left. */
   slot: number;
 }
@@ -583,6 +589,7 @@ export class Stage {
       textures,
       talkTimer: null,
       starterTimer: null,
+      thumbnailTimer: null,
       slot,
     };
     // Owned by the stage from here on, so teardown frees it on any later failure.
@@ -604,6 +611,57 @@ export class Stage {
         entry.starterTimer = null;
         if (this.loaded.includes(entry)) this.playAnimation(characterId, starter.animation);
       }, Math.max(0, starter.delay));
+    }
+
+    // A model's first appearance gives the library its thumbnail.
+    if (!record.thumbnail) {
+      entry.thumbnailTimer = window.setTimeout(() => {
+        entry.thumbnailTimer = null;
+        if (!this.loaded.includes(entry) || this.deps.getModelRecord(record.id)?.thumbnail) return;
+        const dataUrl = this.captureThumbnail(characterId);
+        if (dataUrl) this.deps.saveThumbnail(record.id, dataUrl);
+      }, THUMBNAIL_DELAY_MS);
+    }
+  }
+
+  /**
+   * A square picture of a character's model, upright and centered, as an image
+   * data URL; null when it isn't on stage. The model is drawn alone into the
+   * canvas's corner, copied, and the frame drawn again, all before the browser
+   * shows the canvas, so nothing flickers.
+   */
+  captureThumbnail(characterId: string): string | null {
+    const gl = this.gl;
+    const entry = this.entryFor(characterId);
+    const width = this.hostWidth;
+    const height = this.hostHeight;
+    if (!gl || !entry || width === 0 || height === 0 || gl.context.gl.isContextLost()) return null;
+    const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, gl.canvas.width, gl.canvas.height);
+    if (pixels < 32) return null;
+    // The square in host CSS pixels, and the model's current pose fitted into it.
+    const box = (pixels * width) / gl.canvas.width;
+    const bounds = visibleBounds(entry.skeleton) ?? entry.bounds;
+    const scale = (box * 0.96) / Math.max(bounds.width, bounds.height);
+    const centerX = bounds.x + bounds.width / 2;
+    const centerY = bounds.y + bounds.height / 2;
+    const fitted: Affine = { a: scale, b: 0, c: 0, d: -scale, e: box / 2 - scale * centerX, f: box / 2 + scale * centerY };
+    const context = gl.context.gl;
+    try {
+      context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
+      context.clearColor(0, 0, 0, 0);
+      context.clear(context.COLOR_BUFFER_BIT);
+      this.drawEntry(gl, entry, this.settingsFor(entry), width, height, fitted);
+      return squareThumbnail(gl.canvas, pixels);
+    } catch (error) {
+      this.deps.log(`Thumbnail failed: ${String(error)}`);
+      return null;
+    } finally {
+      this.draw(
+        gl,
+        this.loaded.map((other) => ({ entry: other, settings: this.settingsFor(other) })),
+        width,
+        height,
+      );
     }
   }
 
@@ -690,8 +748,14 @@ export class Stage {
     }
   }
 
-  private drawEntry(gl: Gl, entry: LoadedEntry, settings: ModelSettings, width: number, height: number): void {
-    const t = this.transform(entry, settings, width, height);
+  private drawEntry(
+    gl: Gl,
+    entry: LoadedEntry,
+    settings: ModelSettings,
+    width: number,
+    height: number,
+    t: Affine = this.transform(entry, settings, width, height),
+  ): void {
     // Host CSS pixels -> clip space, folded into the skeleton transform.
     const m = gl.mvp.values;
     m.fill(0);
@@ -1087,6 +1151,7 @@ export class Stage {
     for (const entry of entries) {
       if (entry.talkTimer !== null) window.clearTimeout(entry.talkTimer);
       if (entry.starterTimer !== null) window.clearTimeout(entry.starterTimer);
+      if (entry.thumbnailTimer !== null) window.clearTimeout(entry.thumbnailTimer);
       for (const texture of entry.textures) {
         try {
           texture.dispose();

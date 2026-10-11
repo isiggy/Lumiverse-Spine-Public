@@ -6,8 +6,9 @@ Plays skeletons exported from **Spine 4.1** (binary `.skel` or `.json`), with th
 
 ## Features
 
-- **Model library**: import Spine model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached in the browser (Cache Storage) for instant reloads.
-- **Per-character bindings**: assign a model to each character; it loads when you open that character's chat.
+- **Model library**: import Spine model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached in the browser (Cache Storage) for instant reloads. Shown as tiles with a thumbnail of each model (taken the first time it's shown; *Update thumbnail* under *Model settings* retakes it) or as a list, filtered by name and sorted by name, import date or size.
+- **Per-character bindings**: assign a model to each character; it loads when you open that character's chat. The character and model dropdowns have a search field once the list gets long.
+- **Settings files**: *Export settings* saves a character's model and animation settings for its model to a `.json` file; *Import settings* loads one onto the selected character, binding it to the file's model (found by id, then name). The file format is shared with the Live2D Avatars extension, which refuses Spine files and vice versa.
 - **Group chats**: every member with a model is on stage at once. The stage is split into equal columns, one per model, left to right in member order, and each model's zoom, offsets and *Fit to canvas* work within its own column (a solo chat's one column is the whole stage). Talking, emotion and click animations play on the member they belong to, and clicking a member's model with *Auto-send interaction* on gets the reply from that member. Members joining or leaving re-lay the stage out.
 - **View controls** (per character and model):
   - **Render scale**: the resolution the model is drawn at, relative to the screen. Lower is faster and softer, higher is sharper. It doesn't change the model's size.
