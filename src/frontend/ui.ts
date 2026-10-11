@@ -555,7 +555,8 @@ export class SettingsUI {
         bindingSection.appendChild(
           note(
             'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
-              'model, in member order; zoom, X and Y offset and Fit to canvas work within that column.',
+              'member with a model (Spine or, with the Live2D Avatars extension, Live2D), in member order; ' +
+              'zoom, X and Y offset and Fit to canvas work within that column.',
           ),
         );
       }

@@ -10727,6 +10727,80 @@ var ResizeMode;
   ResizeMode[ResizeMode["Expand"] = 1] = "Expand";
   ResizeMode[ResizeMode["Fit"] = 2] = "Fit";
 })(ResizeMode || (ResizeMode = {}));
+// src/frontend/columns.ts
+var REGISTRY_KEY = "__lumiverseAvatarColumns";
+var CHANGED_EVENT = "lumiverse-avatar-columns-changed";
+function registry() {
+  const scope = window;
+  const existing = scope[REGISTRY_KEY];
+  if (existing?.version === 1 && existing.extensions && typeof existing.extensions === "object") {
+    return existing;
+  }
+  const fresh = { version: 1, extensions: {} };
+  scope[REGISTRY_KEY] = fresh;
+  return fresh;
+}
+function sameList(a, b) {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+function sameColumns(a, b) {
+  if (a.count !== b.count || a.index.size !== b.index.size)
+    return false;
+  for (const [characterId, column] of a.index) {
+    if (b.index.get(characterId) !== column)
+      return false;
+  }
+  return true;
+}
+
+class SharedColumns {
+  extensionId;
+  onChange;
+  published = null;
+  listener = (event) => {
+    if (event.detail?.extension !== this.extensionId)
+      this.onChange();
+  };
+  constructor(extensionId, onChange) {
+    this.extensionId = extensionId;
+    this.onChange = onChange;
+    window.addEventListener(CHANGED_EVENT, this.listener);
+  }
+  publish(characterIds) {
+    const sorted = [...new Set(characterIds)].sort();
+    if (this.published && sameList(sorted, this.published))
+      return;
+    this.published = sorted;
+    registry().extensions[this.extensionId] = sorted;
+    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+  }
+  layout(members, own, shared) {
+    const withModel = new Set(own);
+    if (shared) {
+      for (const [extension, characterIds] of Object.entries(registry().extensions)) {
+        if (extension === this.extensionId || !Array.isArray(characterIds))
+          continue;
+        for (const characterId of characterIds)
+          withModel.add(characterId);
+      }
+    }
+    const index = new Map;
+    for (const characterId of members) {
+      if (withModel.has(characterId) && !index.has(characterId))
+        index.set(characterId, index.size);
+    }
+    return { count: Math.max(1, index.size), index };
+  }
+  destroy() {
+    window.removeEventListener(CHANGED_EVENT, this.listener);
+    const extensions = registry().extensions;
+    if (!(this.extensionId in extensions))
+      return;
+    delete extensions[this.extensionId];
+    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+  }
+}
+
 // src/frontend/thumbnail.ts
 var THUMBNAIL_PIXELS = 256;
 var THUMBNAIL_RENDER_PIXELS = 512;
@@ -11159,9 +11233,10 @@ class Stage {
   host = null;
   gl = null;
   loaded = [];
-  slotCount = 1;
   chatId = null;
   characterIds = [];
+  columns = { count: 1, index: new Map };
+  sharedColumns;
   loadToken = 0;
   frameRequest = null;
   lastFrameTime = 0;
@@ -11187,6 +11262,7 @@ class Stage {
     this.deps = deps;
     for (const [target, type, listener, options] of this.listeners)
       target.addEventListener(type, listener, options);
+    this.sharedColumns = new SharedColumns("spine_avatars", () => this.updateColumns());
   }
   destroy() {
     for (const [target, type, listener, options] of this.listeners) {
@@ -11197,6 +11273,7 @@ class Stage {
     this.hoverFrame = null;
     this.setHovering(false);
     this.teardown();
+    this.sharedColumns.destroy();
   }
   setHost(host) {
     if (this.host === host)
@@ -11229,23 +11306,46 @@ class Stage {
   entryFor(characterId) {
     return this.loaded.find((entry) => entry.characterId === characterId);
   }
+  boundCharacters(settings) {
+    const bound = new Map;
+    if (!settings.global.enabled)
+      return bound;
+    for (const [characterId, modelId] of Object.entries(settings.characterModelMapping)) {
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record)
+        bound.set(characterId, record);
+    }
+    return bound;
+  }
+  updateColumns() {
+    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
+    const overApp = this.host !== null && this.deps.drawsOverApp();
+    this.sharedColumns.publish(overApp ? own : []);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    if (sameColumns(columns, this.columns))
+      return;
+    this.columns = columns;
+    this.sortEntries();
+  }
+  sortEntries() {
+    const column = (entry) => this.columns.index.get(entry.characterId) ?? 0;
+    this.loaded.sort((a, b) => column(a) - column(b));
+  }
   async reload() {
     this.teardown();
     const token = this.loadToken;
+    this.updateColumns();
     const settings = this.deps.getSettings();
     if (!settings.global.enabled || !this.host)
       return;
-    const cast = [];
-    for (const characterId of this.characterIds) {
-      const modelId = settings.characterModelMapping[characterId];
-      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
-      if (record)
-        cast.push({ characterId, record });
-    }
+    const bound = this.boundCharacters(settings);
+    const cast = this.characterIds.flatMap((characterId) => {
+      const record = bound.get(characterId);
+      return record ? [{ characterId, record }] : [];
+    });
     if (cast.length === 0)
       return;
-    this.slotCount = cast.length;
-    await Promise.all(cast.map(async ({ characterId, record }, slot) => {
+    await Promise.all(cast.map(async ({ characterId, record }) => {
       let bundle;
       try {
         bundle = await this.deps.assets.load(record);
@@ -11256,7 +11356,7 @@ class Stage {
       if (token !== this.loadToken || !this.host)
         return;
       try {
-        await this.loadModel(characterId, record, bundle, slot, token);
+        await this.loadModel(characterId, record, bundle, token);
       } catch (error) {
         if (token === this.loadToken)
           this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
@@ -11324,7 +11424,7 @@ class Stage {
       throw error;
     }
   }
-  async loadModel(characterId, record, bundle, slot, token) {
+  async loadModel(characterId, record, bundle, token) {
     const host = this.host;
     const atlas = await readAtlas(bundle);
     const atlasDir = dirname(bundle.atlasFile);
@@ -11395,11 +11495,10 @@ class Stage {
       textures,
       talkTimer: null,
       starterTimer: null,
-      thumbnailTimer: null,
-      slot
+      thumbnailTimer: null
     };
     this.loaded.push(entry);
-    this.loaded.sort((a, b) => a.slot - b.slot);
+    this.sortEntries();
     this.applySkinTo(entry, modelSettings);
     this.startIdle(entry, modelSettings);
     entry.bounds = measureReferenceBounds(data, modelSettings);
@@ -11563,8 +11662,8 @@ class Stage {
     shader.unbind();
   }
   slotOf(entry, width, height) {
-    const slotWidth = width / Math.max(1, this.slotCount);
-    return { x: slotWidth * entry.slot, width: slotWidth, height };
+    const slotWidth = width / Math.max(1, this.columns.count);
+    return { x: slotWidth * (this.columns.index.get(entry.characterId) ?? 0), width: slotWidth, height };
   }
   transform(entry, settings, stageWidth, stageHeight) {
     const { x: left, width, height } = this.slotOf(entry, stageWidth, stageHeight);
@@ -11867,7 +11966,6 @@ class Stage {
     }
     const entries = this.loaded;
     this.loaded = [];
-    this.slotCount = 1;
     for (const entry of entries) {
       if (entry.talkTimer !== null)
         window.clearTimeout(entry.talkTimer);
@@ -12273,7 +12371,7 @@ class SettingsUI {
       bindingSection.appendChild(row("Character", characterSelect));
       bindingSection.appendChild(row("Model", modelSelect));
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "model, in member order; zoom, X and Y offset and Fit to canvas work within that column."));
+        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "member with a model (Spine or, with the Live2D Avatars extension, Live2D), in member order; " + "zoom, X and Y offset and Fit to canvas work within that column."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "spn-dim", this.fileStatusText);
@@ -12811,6 +12909,7 @@ function setup(ctx) {
     getModelRecord: (modelId) => models.find((model) => model.id === modelId),
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
+    drawsOverApp: () => overlayActive,
     layoutChanged: () => ui.layoutChanged(),
     assets,
     sendInteraction: (message, characterId) => {
