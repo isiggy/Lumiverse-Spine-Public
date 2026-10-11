@@ -43,8 +43,8 @@ export interface UIController {
 const REQUIRED_PERMS: Array<{ id: string; why: string }> = [
   { id: 'app_manipulation', why: 'show the avatar over the app (otherwise it renders inside this tab)' },
   { id: 'generation', why: 'classify message emotions with the LLM' },
-  { id: 'chat_mutation', why: 'read messages for emotion/talking and send click interaction messages' },
-  { id: 'chats', why: 'know which character the active chat belongs to' },
+  { id: 'chat_mutation', why: 'send click interaction messages' },
+  { id: 'chats', why: 'know which characters are in the active chat (needed for group chats)' },
   { id: 'characters', why: 'list your characters by name when assigning models' },
 ];
 
@@ -348,11 +348,20 @@ export class SettingsUI {
     root.appendChild(section('Model library', library));
 
     // ── Character binding ──
-    const characters = [...controller.getCharacters()];
+    const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
-    if (activeCharacterId && !characters.some((character) => character.id === activeCharacterId)) {
-      characters.unshift({ id: activeCharacterId, name: 'Current chat character' });
-    }
+    // The chat's characters come first, marked, in member order.
+    const inChat = controller.stage.getChatContext().characterIds;
+    if (activeCharacterId && !inChat.includes(activeCharacterId)) inChat.unshift(activeCharacterId);
+    const isGroup = inChat.length > 1;
+    const characters = [
+      ...inChat.map((id, index) => {
+        const name = known.find((character) => character.id === id)?.name;
+        const fallback = isGroup ? `Group member ${index + 1}` : 'Current chat character';
+        return { id, name: `${name ?? fallback} (in this chat)` };
+      }),
+      ...known.filter((character) => !inChat.includes(character.id)),
+    ];
     // Follow the chat: when it switches, move the selection along unless the
     // user had picked some other character.
     if (activeCharacterId !== this.lastActiveCharacterId) {
@@ -402,6 +411,14 @@ export class SettingsUI {
       );
       bindingSection.appendChild(row('Character', characterSelect));
       bindingSection.appendChild(row('Model', modelSelect));
+      if (isGroup) {
+        bindingSection.appendChild(
+          note(
+            'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
+              'model, in member order; zoom, X and Y offset and Fit to canvas work within that column.',
+          ),
+        );
+      }
       bindingSection.appendChild(
         row(
           button('Clear model settings for this character', () => {
@@ -480,9 +497,9 @@ export class SettingsUI {
     root.appendChild(test);
   }
 
-  /** Whether this character's chat is the one on stage (its binding changes show there). */
+  /** Whether this character is in the chat on stage (its binding changes show there). */
   private isOnStage(characterId: string): boolean {
-    return this.controller.stage.getChatContext().characterId === characterId;
+    return this.controller.stage.getChatContext().characterIds.includes(characterId);
   }
 
   private renderModelSettings(
@@ -494,15 +511,12 @@ export class SettingsUI {
     const controller = this.controller;
     const stage = controller.stage;
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
-    const isLive = () => {
-      const current = stage.currentModel();
-      return current !== null && current.characterId === characterId && current.modelId === modelId;
-    };
+    const isLive = () => stage.isOnStage(characterId, modelId);
     /** Why buttons that act on the stage can't, or null when the model is on stage. */
     const notLiveReason = (): string | null => {
       if (isLive()) return null;
       if (!controller.getSettings().global.enabled) return 'Spine is turned off (Global → Enabled).';
-      if (stage.getChatContext().characterId !== characterId) {
+      if (!this.isOnStage(characterId)) {
         return 'Open a chat with this character to see the model on stage.';
       }
       return "The model isn't on stage yet. If it doesn't appear, use Debug → Reload Spine.";
@@ -591,7 +605,7 @@ export class SettingsUI {
     const animationStatus = statusLine();
     const emotionStatus = statusLine();
     const preview = (label: string, status: { say(text: string): void }, name: () => string) => {
-      const play = button('▶', () => onStage(status, () => stage.playAnimation(name())));
+      const play = button('▶', () => onStage(status, () => stage.playAnimation(characterId, name())));
       play.setAttribute('aria-label', `Play ${label} animation`);
       return play;
     };
@@ -607,7 +621,7 @@ export class SettingsUI {
             (value) => {
               modelSettings.skin = value;
               changed();
-              if (isLive()) stage.applySkin();
+              if (isLive()) stage.applySkin(characterId);
             },
           ),
         ),
@@ -619,7 +633,7 @@ export class SettingsUI {
         select(options, modelSettings.animation_idle, (value) => {
           modelSettings.animation_idle = value;
           changed();
-          if (isLive()) stage.applyIdle();
+          if (isLive()) stage.applyIdle(characterId);
         }),
       ),
     );

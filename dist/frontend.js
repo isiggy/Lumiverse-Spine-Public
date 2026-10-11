@@ -11095,16 +11095,16 @@ class Stage {
   deps;
   host = null;
   gl = null;
-  loaded = null;
+  loaded = [];
+  slotCount = 1;
   chatId = null;
-  characterId = null;
+  characterIds = [];
   loadToken = 0;
   frameRequest = null;
   lastFrameTime = 0;
   hostWidth = 0;
   hostHeight = 0;
   resizeObserver = null;
-  starterTimer = null;
   previousInteraction = { characterId: "", message: "" };
   descriptionCache = new Map;
   drag = null;
@@ -11142,51 +11142,63 @@ class Stage {
     this.host = host;
     this.reload();
   }
-  setChatContext(chatId, characterId) {
-    const changed = chatId !== this.chatId || characterId !== this.characterId;
+  setChatContext(chatId, characterIds) {
+    const unique = [...new Set(characterIds.filter(Boolean))];
+    const changed = chatId !== this.chatId || unique.length !== this.characterIds.length || unique.some((id, index) => id !== this.characterIds[index]);
     this.chatId = chatId;
-    this.characterId = characterId;
+    this.characterIds = unique;
     if (changed)
       this.reload();
   }
   getChatContext() {
-    return { chatId: this.chatId, characterId: this.characterId };
+    return { chatId: this.chatId, characterIds: [...this.characterIds] };
   }
-  currentModel() {
-    return this.loaded ? { characterId: this.loaded.characterId, modelId: this.loaded.modelId } : null;
+  isOnStage(characterId, modelId) {
+    const entry = this.entryFor(characterId);
+    return entry !== undefined && (modelId === undefined || entry.modelId === modelId);
   }
-  getDescription() {
-    return this.loaded?.description ?? null;
+  charactersOnStage() {
+    return this.loaded.map((entry) => entry.characterId);
+  }
+  getDescription(characterId) {
+    return this.entryFor(characterId)?.description ?? null;
+  }
+  entryFor(characterId) {
+    return this.loaded.find((entry) => entry.characterId === characterId);
   }
   async reload() {
     this.teardown();
     const token = this.loadToken;
     const settings = this.deps.getSettings();
-    if (!settings.global.enabled || !this.host || !this.characterId)
+    if (!settings.global.enabled || !this.host)
       return;
-    const modelId = settings.characterModelMapping[this.characterId];
-    if (!modelId)
-      return;
-    const record = this.deps.getModelRecord(modelId);
-    if (!record)
-      return;
-    let bundle;
-    try {
-      bundle = await this.deps.assets.load(record);
-    } catch (error) {
-      this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
-      return;
+    const cast = [];
+    for (const characterId of this.characterIds) {
+      const modelId = settings.characterModelMapping[characterId];
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record)
+        cast.push({ characterId, record });
     }
-    if (token !== this.loadToken || !this.host)
+    if (cast.length === 0)
       return;
-    try {
-      await this.loadModel(record, bundle, token);
-    } catch (error) {
-      if (token === this.loadToken) {
-        this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
-        this.teardown();
+    this.slotCount = cast.length;
+    await Promise.all(cast.map(async ({ characterId, record }, slot) => {
+      let bundle;
+      try {
+        bundle = await this.deps.assets.load(record);
+      } catch (error) {
+        this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
+        return;
       }
-    }
+      if (token !== this.loadToken || !this.host)
+        return;
+      try {
+        await this.loadModel(characterId, record, bundle, slot, token);
+      } catch (error) {
+        if (token === this.loadToken)
+          this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
+      }
+    }));
   }
   createGl(host) {
     const canvas = document.createElement("canvas");
@@ -11233,8 +11245,9 @@ class Stage {
         if (result.restoreTimer !== null)
           window.clearTimeout(result.restoreTimer);
         result.restoreTimer = null;
-        const entry = this.loaded;
-        if (this.gl === result && entry) {
+        if (this.gl !== result)
+          return;
+        for (const entry of this.loaded) {
           entry.atlas.pages.forEach((page, index) => {
             const texture = entry.textures[index];
             if (texture)
@@ -11248,8 +11261,7 @@ class Stage {
       throw error;
     }
   }
-  async loadModel(record, bundle, token) {
-    const characterId = this.characterId;
+  async loadModel(characterId, record, bundle, slot, token) {
     const host = this.host;
     const atlas = await readAtlas(bundle);
     const atlasDir = dirname(bundle.atlasFile);
@@ -11279,14 +11291,17 @@ class Stage {
     const description = describeSkeleton(data, atlas, record);
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     const modelSettings = this.deps.getModelSettings(characterId, record.id, description);
-    let gl;
-    try {
-      gl = this.createGl(host);
-    } catch (error) {
-      closeImages();
-      throw error;
+    let gl = this.gl;
+    if (!gl) {
+      try {
+        gl = this.createGl(host);
+      } catch (error) {
+        closeImages();
+        throw error;
+      }
+      this.gl = gl;
+      this.observeSize(gl.canvas);
     }
-    this.gl = gl;
     const textures = [];
     try {
       atlas.pages.forEach((page, index) => {
@@ -11315,21 +11330,25 @@ class Stage {
       state: new AnimationState(stateData),
       bounds: { x: 0, y: 0, width: 1, height: 1 },
       textures,
-      talkTimer: null
+      talkTimer: null,
+      starterTimer: null,
+      slot
     };
-    this.loaded = entry;
+    this.loaded.push(entry);
+    this.loaded.sort((a, b) => a.slot - b.slot);
     this.applySkinTo(entry, modelSettings);
     this.startIdle(entry, modelSettings);
     entry.bounds = measureReferenceBounds(data, modelSettings);
-    this.observeSize(gl.canvas);
-    this.lastFrameTime = performance.now();
-    this.frameRequest = window.requestAnimationFrame(this.frame);
+    if (this.frameRequest === null) {
+      this.lastFrameTime = performance.now();
+      this.frameRequest = window.requestAnimationFrame(this.frame);
+    }
     const starter = modelSettings.animation_starter;
     if (starter.animation !== "none") {
-      this.starterTimer = window.setTimeout(() => {
-        this.starterTimer = null;
-        if (this.loaded === entry)
-          this.playAnimation(starter.animation);
+      entry.starterTimer = window.setTimeout(() => {
+        entry.starterTimer = null;
+        if (this.loaded.includes(entry))
+          this.playAnimation(characterId, starter.animation);
       }, Math.max(0, starter.delay));
     }
   }
@@ -11351,24 +11370,28 @@ class Stage {
   }
   frame = (now) => {
     this.frameRequest = null;
-    const entry = this.loaded;
     const gl = this.gl;
-    if (!entry || !gl)
+    if (this.loaded.length === 0 || !gl)
       return;
     this.frameRequest = window.requestAnimationFrame(this.frame);
     const delta = Math.min(MAX_DELTA, Math.max(0, (now - this.lastFrameTime) / 1000));
     this.lastFrameTime = now;
-    const settings = this.settingsFor(entry);
-    const step = delta * settings.speed;
-    entry.state.update(step);
-    entry.state.apply(entry.skeleton);
-    entry.skeleton.updateWorldTransform();
+    let renderScale = 0;
+    const drawn = [];
+    for (const entry of this.loaded) {
+      const settings = this.settingsFor(entry);
+      entry.state.update(delta * settings.speed);
+      entry.state.apply(entry.skeleton);
+      entry.skeleton.updateWorldTransform();
+      renderScale = Math.max(renderScale, settings.renderScale);
+      drawn.push({ entry, settings });
+    }
     const width = this.hostWidth;
     const height = this.hostHeight;
     if (width === 0 || height === 0 || gl.context.gl.isContextLost())
       return;
-    this.resizeCanvas(gl, width, height, settings.renderScale);
-    this.draw(gl, entry, settings, width, height);
+    this.resizeCanvas(gl, width, height, renderScale);
+    this.draw(gl, drawn, width, height);
   };
   resizeCanvas(gl, width, height, renderScale) {
     const density = (window.devicePixelRatio || 1) * renderScale;
@@ -11384,11 +11407,19 @@ class Stage {
     if (gl.canvas.height !== pixelHeight)
       gl.canvas.height = pixelHeight;
   }
-  draw(gl, entry, settings, width, height) {
+  draw(gl, drawn, width, height) {
     const context = gl.context.gl;
     context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
     context.clearColor(0, 0, 0, 0);
     context.clear(context.COLOR_BUFFER_BIT);
+    const showBounds = this.deps.getSettings().global.showBounds;
+    for (const { entry, settings } of drawn) {
+      this.drawEntry(gl, entry, settings, width, height);
+      if (showBounds)
+        this.drawDebug(gl, entry, gl.mvp.values);
+    }
+  }
+  drawEntry(gl, entry, settings, width, height) {
     const t = this.transform(entry, settings, width, height);
     const m = gl.mvp.values;
     m.fill(0);
@@ -11408,8 +11439,6 @@ class Stage {
     gl.renderer.draw(gl.batcher, entry.skeleton);
     gl.batcher.end();
     gl.shader.unbind();
-    if (this.deps.getSettings().global.showBounds)
-      this.drawDebug(gl, entry, m);
   }
   drawDebug(gl, entry, mvp) {
     if (!gl.debugShader) {
@@ -11430,7 +11459,12 @@ class Stage {
     shapes.end();
     shader.unbind();
   }
-  transform(entry, settings, width, height) {
+  slotOf(entry, width, height) {
+    const slotWidth = width / Math.max(1, this.slotCount);
+    return { x: slotWidth * entry.slot, width: slotWidth, height };
+  }
+  transform(entry, settings, stageWidth, stageHeight) {
+    const { x: left, width, height } = this.slotOf(entry, stageWidth, stageHeight);
     const bounds = entry.bounds;
     const fit = Math.min(width / bounds.width, height / bounds.height);
     const scale = fit * settings.zoom;
@@ -11439,7 +11473,7 @@ class Stage {
     const sin = Math.sin(angle);
     const centerX = bounds.x + bounds.width / 2;
     const centerY = bounds.y + bounds.height / 2;
-    const targetX = width / 2 + width / 2 * settings.x / 100;
+    const targetX = left + width / 2 + width / 2 * settings.x / 100;
     const targetY = height / 2 + height / 2 * settings.y / 100;
     const a = scale * cos;
     const c = scale * sin;
@@ -11457,13 +11491,12 @@ class Stage {
     return { x: (t.d * u - t.c * v) / det, y: (-t.b * u + t.a * v) / det };
   }
   fitToCanvas(characterId, modelId) {
-    const entry = this.loaded;
-    if (!entry || entry.characterId !== characterId || entry.modelId !== modelId)
+    const entry = this.entryFor(characterId);
+    if (!entry || entry.modelId !== modelId)
       return false;
-    const width = this.hostWidth;
-    const height = this.hostHeight;
-    if (width === 0 || height === 0)
+    if (this.hostWidth === 0 || this.hostHeight === 0)
       return false;
+    const { width, height } = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const settings = this.settingsFor(entry);
     const { width: boundsWidth, height: boundsHeight } = entry.bounds;
     const angle = settings.rotation * Math.PI / 180;
@@ -11499,24 +11532,24 @@ class Stage {
     else
       entry.state.setEmptyAnimation(0, DEFAULT_MIX);
   }
-  applySkin() {
-    const entry = this.loaded;
+  applySkin(characterId) {
+    const entry = this.entryFor(characterId);
     if (!entry)
       return;
     const settings = this.settingsFor(entry);
     this.applySkinTo(entry, settings);
     entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
   }
-  applyIdle() {
-    const entry = this.loaded;
+  applyIdle(characterId) {
+    const entry = this.entryFor(characterId);
     if (!entry)
       return;
     const settings = this.settingsFor(entry);
     this.startIdle(entry, settings);
     entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
   }
-  playAnimation(name) {
-    const entry = this.loaded;
+  playAnimation(characterId, name) {
+    const entry = this.entryFor(characterId);
     if (!entry)
       return;
     const animation = this.findAnimation(entry, name);
@@ -11529,8 +11562,8 @@ class Stage {
     else
       entry.state.addEmptyAnimation(0, DEFAULT_MIX, 0);
   }
-  playTalk(textLength) {
-    const entry = this.loaded;
+  playTalk(characterId, textLength) {
+    const entry = this.entryFor(characterId);
     if (!entry || textLength <= 0)
       return;
     const settings = this.settingsFor(entry);
@@ -11549,7 +11582,7 @@ class Stage {
     const duration = textLength * settings.talk_time_per_character / speed;
     entry.talkTimer = window.setTimeout(() => {
       entry.talkTimer = null;
-      if (this.loaded === entry)
+      if (this.loaded.includes(entry))
         entry.state.setEmptyAnimation(1, DEFAULT_MIX);
     }, duration);
   }
@@ -11565,22 +11598,26 @@ class Stage {
     this.descriptionCache.set(key, description);
     return description;
   }
-  isModelInteraction(event) {
-    const entry = this.loaded;
+  modelAt(event) {
     const canvas = this.gl?.canvas;
-    if (!entry || !canvas)
-      return false;
+    if (this.loaded.length === 0 || !canvas)
+      return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR))
-      return false;
+      return null;
     const previous = canvas.style.pointerEvents;
     canvas.style.pointerEvents = "auto";
     const topmost = document.elementFromPoint(event.clientX, event.clientY);
     canvas.style.pointerEvents = previous;
     if (topmost !== canvas)
-      return false;
+      return null;
     const point = this.toStagePoint(event);
-    return this.isOverModel(entry, point.x, point.y);
+    for (let i = this.loaded.length - 1;i >= 0; i--) {
+      const entry = this.loaded[i];
+      if (this.isOverModel(entry, point.x, point.y))
+        return entry;
+    }
+    return null;
   }
   isOverModel(entry, stageX, stageY) {
     const point = this.toSkeletonPoint(entry, stageX, stageY);
@@ -11605,15 +11642,18 @@ class Stage {
   }
   modelCenter(entry) {
     const settings = this.settingsFor(entry);
+    const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     return {
-      x: this.hostWidth / 2 + this.hostWidth / 2 * settings.x / 100,
-      y: this.hostHeight / 2 + this.hostHeight / 2 * settings.y / 100
+      x: slot.x + slot.width / 2 + slot.width / 2 * settings.x / 100,
+      y: slot.height / 2 + slot.height / 2 * settings.y / 100
     };
   }
   onPointerDown(event) {
-    if (event.button !== 0 || !this.isModelInteraction(event))
+    if (event.button !== 0)
       return;
-    const entry = this.loaded;
+    const entry = this.modelAt(event);
+    if (!entry)
+      return;
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -11635,18 +11675,18 @@ class Stage {
       this.dragTo(drag, event);
       return;
     }
-    if (!this.loaded)
+    if (this.loaded.length === 0)
       return;
     if (event.pointerType === "mouse" && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.isModelInteraction(event));
+        this.setHovering(this.modelAt(event) !== null);
       });
     }
   }
   dragTo(drag, event) {
     const { entry } = drag;
-    if (this.loaded !== entry || this.hostWidth === 0 || this.hostHeight === 0)
+    if (!this.loaded.includes(entry) || this.hostWidth === 0 || this.hostHeight === 0)
       return;
     const point = this.toStagePoint(event);
     const center = this.modelCenter(entry);
@@ -11656,10 +11696,11 @@ class Stage {
       return;
     drag.moved = true;
     const settings = this.settingsFor(entry);
+    const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const { min, max } = SETTINGS_LIMITS.offset;
     const percent = (value) => Math.min(max, Math.max(min, Math.round(value * 100) / 100));
-    settings.x = percent((newX - this.hostWidth / 2) / (this.hostWidth / 2) * 100);
-    settings.y = percent((newY - this.hostHeight / 2) / (this.hostHeight / 2) * 100);
+    settings.x = percent((newX - slot.x - slot.width / 2) / (slot.width / 2) * 100);
+    settings.y = percent((newY - slot.height / 2) / (slot.height / 2) * 100);
     this.deps.saveSettingsDebounced();
     this.deps.layoutChanged();
   }
@@ -11670,7 +11711,7 @@ class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded === drag.entry)
+    if (!drag.moved && this.loaded.includes(drag.entry))
       this.onModelClick(drag.entry);
   }
   endDrag() {
@@ -11703,11 +11744,11 @@ class Stage {
         this.deps.log("Same as last interaction, message not sent again.");
       } else {
         this.previousInteraction = { characterId: entry.characterId, message: click.message };
-        this.deps.sendInteraction(click.message);
+        this.deps.sendInteraction(click.message, entry.characterId);
       }
     }
     if (click.animation !== "none")
-      this.playAnimation(click.animation);
+      this.playAnimation(entry.characterId, click.animation);
   }
   teardown() {
     this.loadToken++;
@@ -11721,15 +11762,14 @@ class Stage {
       window.cancelAnimationFrame(this.frameRequest);
       this.frameRequest = null;
     }
-    if (this.starterTimer !== null) {
-      window.clearTimeout(this.starterTimer);
-      this.starterTimer = null;
-    }
-    const entry = this.loaded;
-    this.loaded = null;
-    if (entry) {
+    const entries = this.loaded;
+    this.loaded = [];
+    this.slotCount = 1;
+    for (const entry of entries) {
       if (entry.talkTimer !== null)
         window.clearTimeout(entry.talkTimer);
+      if (entry.starterTimer !== null)
+        window.clearTimeout(entry.starterTimer);
       for (const texture of entry.textures) {
         try {
           texture.dispose();
@@ -11759,8 +11799,8 @@ class Stage {
 var REQUIRED_PERMS = [
   { id: "app_manipulation", why: "show the avatar over the app (otherwise it renders inside this tab)" },
   { id: "generation", why: "classify message emotions with the LLM" },
-  { id: "chat_mutation", why: "read messages for emotion/talking and send click interaction messages" },
-  { id: "chats", why: "know which character the active chat belongs to" },
+  { id: "chat_mutation", why: "send click interaction messages" },
+  { id: "chats", why: "know which characters are in the active chat (needed for group chats)" },
   { id: "characters", why: "list your characters by name when assigning models" }
 ];
 function el(tag, className, text) {
@@ -11974,11 +12014,20 @@ class SettingsUI {
     }), importStatus));
     library.appendChild(note("Zip the exported model folder: the skeleton (.skel or .json), its .atlas and the atlas page images. " + "Spine 4.1 exports are supported."));
     root.appendChild(section("Model library", library));
-    const characters = [...controller.getCharacters()];
+    const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
-    if (activeCharacterId && !characters.some((character) => character.id === activeCharacterId)) {
-      characters.unshift({ id: activeCharacterId, name: "Current chat character" });
-    }
+    const inChat = controller.stage.getChatContext().characterIds;
+    if (activeCharacterId && !inChat.includes(activeCharacterId))
+      inChat.unshift(activeCharacterId);
+    const isGroup = inChat.length > 1;
+    const characters = [
+      ...inChat.map((id, index) => {
+        const name = known.find((character) => character.id === id)?.name;
+        const fallback = isGroup ? `Group member ${index + 1}` : "Current chat character";
+        return { id, name: `${name ?? fallback} (in this chat)` };
+      }),
+      ...known.filter((character) => !inChat.includes(character.id))
+    ];
     if (activeCharacterId !== this.lastActiveCharacterId) {
       if (activeCharacterId && (!this.selectedCharacterId || this.selectedCharacterId === this.lastActiveCharacterId)) {
         this.selectedCharacterId = activeCharacterId;
@@ -12017,6 +12066,9 @@ class SettingsUI {
       });
       bindingSection.appendChild(row("Character", characterSelect));
       bindingSection.appendChild(row("Model", modelSelect));
+      if (isGroup) {
+        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "model, in member order; zoom, X and Y offset and Fit to canvas work within that column."));
+      }
       bindingSection.appendChild(row(button("Clear model settings for this character", () => {
         const characterId = this.selectedCharacterId;
         if (!characterId)
@@ -12078,22 +12130,19 @@ class SettingsUI {
     root.appendChild(test);
   }
   isOnStage(characterId) {
-    return this.controller.stage.getChatContext().characterId === characterId;
+    return this.controller.stage.getChatContext().characterIds.includes(characterId);
   }
   renderModelSettings(host, characterId, modelId, description) {
     const controller = this.controller;
     const stage = controller.stage;
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
-    const isLive = () => {
-      const current = stage.currentModel();
-      return current !== null && current.characterId === characterId && current.modelId === modelId;
-    };
+    const isLive = () => stage.isOnStage(characterId, modelId);
     const notLiveReason = () => {
       if (isLive())
         return null;
       if (!controller.getSettings().global.enabled)
         return "Spine is turned off (Global → Enabled).";
-      if (stage.getChatContext().characterId !== characterId) {
+      if (!this.isOnStage(characterId)) {
         return "Open a chat with this character to see the model on stage.";
       }
       return "The model isn't on stage yet. If it doesn't appear, use Debug → Reload Spine.";
@@ -12161,7 +12210,7 @@ class SettingsUI {
     const animationStatus = statusLine();
     const emotionStatus = statusLine();
     const preview = (label, status, name) => {
-      const play = button("▶", () => onStage(status, () => stage.playAnimation(name())));
+      const play = button("▶", () => onStage(status, () => stage.playAnimation(characterId, name())));
       play.setAttribute("aria-label", `Play ${label} animation`);
       return play;
     };
@@ -12172,14 +12221,14 @@ class SettingsUI {
         modelSettings.skin = value;
         changed();
         if (isLive())
-          stage.applySkin();
+          stage.applySkin(characterId);
       })));
     }
     animations.appendChild(row("Idle (loops)", select(options, modelSettings.animation_idle, (value) => {
       modelSettings.animation_idle = value;
       changed();
       if (isLive())
-        stage.applyIdle();
+        stage.applyIdle(characterId);
     })));
     animations.appendChild(row("On chat open", select(options, modelSettings.animation_starter.animation, (value) => {
       modelSettings.animation_starter.animation = value;
@@ -12355,7 +12404,7 @@ function setup(ctx) {
     saveSettingsDebounced: saveDebounced,
     layoutChanged: () => ui.layoutChanged(),
     assets,
-    sendInteraction: (message) => {
+    sendInteraction: (message, characterId) => {
       const { chatId } = stage.getChatContext();
       if (!chatId)
         return;
@@ -12363,7 +12412,8 @@ function setup(ctx) {
         type: "interaction",
         chatId,
         message,
-        generate: settings.global.autoSendInteraction
+        generate: settings.global.autoSendInteraction,
+        characterId
       });
     },
     log: (message) => console.debug("[spine]", message)
@@ -12499,19 +12549,35 @@ function setup(ctx) {
     unsubAction();
     inputAction.destroy();
   });
+  const followActiveChat = () => {
+    const active = ctx.getActiveChat();
+    if (stage.getChatContext().chatId !== active.chatId) {
+      const own = active.characterId && !permissions.includes("chats") ? [active.characterId] : [];
+      stage.setChatContext(active.chatId, own);
+    }
+    if (active.chatId)
+      ctx.sendToBackend({ type: "get_chat_context", chatId: active.chatId });
+  };
+  const stageCharacterFor = (chatId, characterId) => {
+    const context = stage.getChatContext();
+    if (!context.chatId || chatId !== context.chatId)
+      return null;
+    const onStage = stage.charactersOnStage();
+    if (characterId)
+      return onStage.includes(characterId) ? characterId : null;
+    return onStage.length === 1 ? onStage[0] : null;
+  };
   const playMappedExpression = (msg) => {
-    const { chatId, characterId } = stage.getChatContext();
-    if (!chatId || msg.chatId !== chatId)
+    const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+    if (!characterId)
       return;
-    if (msg.characterId && characterId && msg.characterId !== characterId)
+    const modelId = settings.characterModelMapping[characterId];
+    if (!modelId)
       return;
-    const current = stage.currentModel();
-    if (!current)
-      return;
-    const modelSettings = getOrCreateModelSettings(current.characterId, current.modelId, stage.getDescription());
+    const modelSettings = getOrCreateModelSettings(characterId, modelId, stage.getDescription(characterId));
     const animation = modelSettings.classify_mapping[msg.label] ?? "none";
     if (animation !== "none")
-      stage.playAnimation(animation);
+      stage.playAnimation(characterId, animation);
   };
   const unsubBackend = ctx.onBackendMessage((payload) => {
     const msg = payload;
@@ -12526,8 +12592,7 @@ function setup(ctx) {
         permissions = msg.permissions;
         stateReceived = true;
         ensureStageHost();
-        const active = ctx.getActiveChat();
-        stage.setChatContext(active.chatId, active.characterId);
+        followActiveChat();
         ui.render();
         break;
       }
@@ -12566,14 +12631,24 @@ function setup(ctx) {
         playMappedExpression(msg);
         break;
       case "character_message": {
-        const { chatId } = stage.getChatContext();
-        if (chatId && msg.chatId === chatId && msg.textLength > 0) {
-          stage.playTalk(msg.textLength);
-        }
+        const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+        if (characterId && msg.textLength > 0)
+          stage.playTalk(characterId, msg.textLength);
         break;
       }
-      case "chat_context":
-        stage.setChatContext(msg.chatId, msg.characterId ?? ctx.getActiveChat().characterId);
+      case "chat_context": {
+        const active = ctx.getActiveChat();
+        if (msg.chatId !== active.chatId)
+          break;
+        const fallback = active.characterId ? [active.characterId] : [];
+        stage.setChatContext(msg.chatId, msg.characterIds?.length ? msg.characterIds : fallback);
+        ui.render();
+        break;
+      }
+      case "chat_members":
+        if (msg.chatId !== stage.getChatContext().chatId)
+          break;
+        stage.setChatContext(msg.chatId, msg.characterIds);
         ui.render();
         break;
       case "classify_test_result":
@@ -12589,6 +12664,7 @@ function setup(ctx) {
       case "permissions_changed":
         permissions = msg.permissions;
         ensureStageHost();
+        followActiveChat();
         ui.render();
         break;
       case "focus_tab":
@@ -12608,8 +12684,7 @@ function setup(ctx) {
   cleanups.push(unsubBackend);
   const unsubChat = ctx.events.on("CHAT_SWITCHED", () => {
     window.setTimeout(() => {
-      const active = ctx.getActiveChat();
-      stage.setChatContext(active.chatId, active.characterId);
+      followActiveChat();
       ui.render();
     }, 50);
   });

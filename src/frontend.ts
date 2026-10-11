@@ -93,7 +93,7 @@ export function setup(ctx: SpindleFrontendContext) {
     saveSettingsDebounced: saveDebounced,
     layoutChanged: () => ui.layoutChanged(),
     assets,
-    sendInteraction: (message) => {
+    sendInteraction: (message, characterId) => {
       const { chatId } = stage.getChatContext();
       if (!chatId) return;
       ctx.sendToBackend({
@@ -101,6 +101,7 @@ export function setup(ctx: SpindleFrontendContext) {
         chatId,
         message,
         generate: settings.global.autoSendInteraction,
+        characterId,
       });
     },
     log: (message) => console.debug('[spine]', message),
@@ -248,16 +249,42 @@ export function setup(ctx: SpindleFrontendContext) {
     inputAction.destroy();
   });
 
+  // ── Chat context ──────────────────────────────────────────────────────────
+  // The backend knows a chat's members (it reads the chat); the frontend only
+  // knows the active chat's own character, which is all there is to go on
+  // when the backend can't read chats. Otherwise clear the stage and wait for
+  // the members, so a group chat doesn't first load one model on its own.
+  const followActiveChat = () => {
+    const active = ctx.getActiveChat();
+    if (stage.getChatContext().chatId !== active.chatId) {
+      const own = active.characterId && !permissions.includes('chats') ? [active.characterId] : [];
+      stage.setChatContext(active.chatId, own);
+    }
+    if (active.chatId) ctx.sendToBackend({ type: 'get_chat_context', chatId: active.chatId });
+  };
+
+  /**
+   * The character a message or expression is about, if its model is on stage.
+   * Without a character (the backend couldn't tell who wrote it) it can only
+   * mean the one model on stage.
+   */
+  const stageCharacterFor = (chatId: string, characterId: string | null): string | null => {
+    const context = stage.getChatContext();
+    if (!context.chatId || chatId !== context.chatId) return null;
+    const onStage = stage.charactersOnStage();
+    if (characterId) return onStage.includes(characterId) ? characterId : null;
+    return onStage.length === 1 ? onStage[0]! : null;
+  };
+
   // ── Backend message handling ──────────────────────────────────────────────
   const playMappedExpression = (msg: ExpressionMsg) => {
-    const { chatId, characterId } = stage.getChatContext();
-    if (!chatId || msg.chatId !== chatId) return;
-    if (msg.characterId && characterId && msg.characterId !== characterId) return;
-    const current = stage.currentModel();
-    if (!current) return;
-    const modelSettings = getOrCreateModelSettings(current.characterId, current.modelId, stage.getDescription());
+    const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+    if (!characterId) return;
+    const modelId = settings.characterModelMapping[characterId];
+    if (!modelId) return;
+    const modelSettings = getOrCreateModelSettings(characterId, modelId, stage.getDescription(characterId));
     const animation = modelSettings.classify_mapping[msg.label] ?? 'none';
-    if (animation !== 'none') stage.playAnimation(animation);
+    if (animation !== 'none') stage.playAnimation(characterId, animation);
   };
 
   const unsubBackend = ctx.onBackendMessage((payload) => {
@@ -274,8 +301,7 @@ export function setup(ctx: SpindleFrontendContext) {
         permissions = msg.permissions;
         stateReceived = true;
         ensureStageHost();
-        const active = ctx.getActiveChat();
-        stage.setChatContext(active.chatId, active.characterId);
+        followActiveChat();
         ui.render();
         break;
       }
@@ -313,14 +339,22 @@ export function setup(ctx: SpindleFrontendContext) {
         playMappedExpression(msg);
         break;
       case 'character_message': {
-        const { chatId } = stage.getChatContext();
-        if (chatId && msg.chatId === chatId && msg.textLength > 0) {
-          stage.playTalk(msg.textLength);
-        }
+        const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+        if (characterId && msg.textLength > 0) stage.playTalk(characterId, msg.textLength);
         break;
       }
-      case 'chat_context':
-        stage.setChatContext(msg.chatId, msg.characterId ?? ctx.getActiveChat().characterId);
+      case 'chat_context': {
+        // Answers can arrive out of order across chat switches; only take the active chat's.
+        const active = ctx.getActiveChat();
+        if (msg.chatId !== active.chatId) break;
+        const fallback = active.characterId ? [active.characterId] : [];
+        stage.setChatContext(msg.chatId, msg.characterIds?.length ? msg.characterIds : fallback);
+        ui.render();
+        break;
+      }
+      case 'chat_members':
+        if (msg.chatId !== stage.getChatContext().chatId) break;
+        stage.setChatContext(msg.chatId, msg.characterIds);
         ui.render();
         break;
       case 'classify_test_result':
@@ -334,6 +368,7 @@ export function setup(ctx: SpindleFrontendContext) {
       case 'permissions_changed':
         permissions = msg.permissions;
         ensureStageHost();
+        followActiveChat(); // with `chats` granted, group members can now be read
         ui.render();
         break;
       case 'focus_tab':
@@ -356,8 +391,7 @@ export function setup(ctx: SpindleFrontendContext) {
   // the fallback when the backend lacks the `chats` permission.
   const unsubChat = ctx.events.on('CHAT_SWITCHED', () => {
     window.setTimeout(() => {
-      const active = ctx.getActiveChat();
-      stage.setChatContext(active.chatId, active.characterId);
+      followActiveChat();
       ui.render();
     }, 50);
   });

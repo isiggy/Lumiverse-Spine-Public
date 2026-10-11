@@ -10,6 +10,7 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
 
 import { TextureAtlas } from '@esotericsoftware/spine-core';
 import { unzipSync } from 'fflate';
+import type { ChatMessageDTO } from 'lumiverse-spindle-types';
 import type {
   BackendToFrontend,
   FrontendToBackend,
@@ -588,53 +589,70 @@ async function classifyExpression(text: string): Promise<{ label: string } | { e
 
 // ── Chat lifecycle ──────────────────────────────────────────────────────────
 
-async function resolveChatCharacter(chatId: string, userId?: string): Promise<string | null> {
+interface ChatCast {
+  /** The chat's own character (a group chat's first member). */
+  characterId: string | null;
+  /** Everyone in the chat, in member order. */
+  characterIds: string[];
+}
+
+/** Group chats list their members in `metadata.character_ids`. */
+function castFromChat(chat: { character_id?: string | null; metadata?: Record<string, unknown> | null }): ChatCast {
+  const metadata = chat.metadata ?? {};
+  const members =
+    metadata.group === true && Array.isArray(metadata.character_ids)
+      ? metadata.character_ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : [];
+  const characterId = chat.character_id ?? members[0] ?? null;
+  return { characterId, characterIds: members.length > 0 ? [...new Set(members)] : characterId ? [characterId] : [] };
+}
+
+async function resolveChatCast(chatId: string, userId?: string): Promise<ChatCast | null> {
   if (!spindle.permissions.has('chats')) return null;
   try {
     const chat = await spindle.chats.get(chatId, userId);
-    return chat?.character_id ?? null;
+    return chat ? castFromChat(chat) : null;
   } catch {
     return null;
   }
 }
 
-async function handleCharacterMessageRendered(
-  payload: { chatId: string; messageId: string },
+async function sendChatContext(chatId: string | null, userId?: string): Promise<void> {
+  const cast = chatId ? await resolveChatCast(chatId, userId) : null;
+  send(
+    { type: 'chat_context', chatId, characterId: cast?.characterId ?? null, characterIds: cast?.characterIds ?? null },
+    userId,
+  );
+}
+
+/**
+ * A character's message arrived: make that character's model talk and, with
+ * LLM emotion detection, play the matching animation. In a group chat the
+ * message says which member wrote it.
+ */
+async function handleCharacterMessage(
+  chatId: string,
+  message: { id: string; content?: string; extra?: Record<string, unknown> | null },
   userId?: string,
 ): Promise<void> {
   const settings = await loadSettings(userId);
   if (!settings.global.enabled) return;
 
-  const characterId = await resolveChatCharacter(payload.chatId, userId);
-
-  let text = '';
-  if (spindle.permissions.has('chat_mutation')) {
-    try {
-      const messages = await spindle.chat.getMessages(payload.chatId);
-      const message = messages.find((entry) => entry.id === payload.messageId);
-      if (message && !message.is_user) text = message.content ?? '';
-    } catch (error) {
-      spindle.log.warn(`spine: could not read message: ${String(error)}`);
-    }
-  }
-
-  send(
-    {
-      type: 'character_message',
-      chatId: payload.chatId,
-      characterId,
-      messageId: payload.messageId,
-      textLength: text.length,
-    },
-    userId,
+  // Replies carry their author as `character_id`; greetings as `greeting_character_id`.
+  const author = [message.extra?.character_id, message.extra?.greeting_character_id].find(
+    (id): id is string => typeof id === 'string' && id.length > 0,
   );
+  const characterId = author ?? (await resolveChatCast(chatId, userId))?.characterId ?? null;
+  const text = message.content ?? '';
+
+  send({ type: 'character_message', chatId, characterId, messageId: message.id, textLength: text.length }, userId);
 
   if (settings.global.expressionSource !== 'llm') return;
   if (!text) return;
 
   const result = await classifyExpression(text);
   if (!('label' in result)) return;
-  send({ type: 'expression', chatId: payload.chatId, characterId, label: result.label, source: 'llm' }, userId);
+  send({ type: 'expression', chatId, characterId, label: result.label, source: 'llm' }, userId);
 }
 
 async function handleInteraction(msg: InteractionMsg, userId?: string): Promise<void> {
@@ -649,7 +667,13 @@ async function handleInteraction(msg: InteractionMsg, userId?: string): Promise<
     await spindle.chat.appendMessage(
       msg.chatId,
       { role: 'user', content: msg.message },
-      msg.generate ? { triggerGeneration: true } : undefined,
+      msg.generate
+        ? {
+            triggerGeneration: true,
+            // Lumiverse only uses the target in group chats, to pick who replies.
+            ...(msg.characterId ? { generation: { target_character_id: msg.characterId } } : {}),
+          }
+        : undefined,
     );
   } catch (error) {
     spindle.log.warn(`spine: interaction failed: ${String(error)}`);
@@ -705,6 +729,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       case 'interaction':
         await handleInteraction(msg, userId);
         break;
+      case 'get_chat_context':
+        await sendChatContext(msg.chatId, userId);
+        break;
       case 'classify_test': {
         const result = await classifyExpression(msg.text);
         send(
@@ -728,10 +755,19 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
 // ── Event subscriptions ─────────────────────────────────────────────────────
 
-spindle.on('CHARACTER_MESSAGE_RENDERED', (payload, userId) => {
-  const event = payload as { chatId: string; messageId: string };
-  if (!event?.chatId || !event?.messageId) return;
-  void handleCharacterMessageRendered(event, userId);
+// Lumiverse creates a reply's message once it has finished streaming, and a
+// regenerated reply as a new swipe. (The documented CHARACTER_MESSAGE_RENDERED
+// event is never emitted by the host.)
+spindle.on('MESSAGE_SENT', (payload, userId) => {
+  const event = payload as { chatId?: string; message?: ChatMessageDTO };
+  if (!event?.chatId || !event.message || event.message.is_user) return;
+  void handleCharacterMessage(event.chatId, event.message, userId);
+});
+
+spindle.on('MESSAGE_SWIPED', (payload, userId) => {
+  const event = payload as { chatId?: string; message?: ChatMessageDTO; action?: string };
+  if (!event?.chatId || !event.message || event.message.is_user || event.action !== 'added') return;
+  void handleCharacterMessage(event.chatId, event.message, userId);
 });
 
 // Reuse Lumiverse's native expression detection when the user prefers it.
@@ -756,9 +792,23 @@ spindle.on('EXPRESSION_CHANGED', (payload, userId) => {
 
 spindle.on('CHAT_SWITCHED', (payload, userId) => {
   const event = payload as { chatId: string | null };
+  void sendChatContext(event?.chatId ?? null, userId);
+});
+
+// Members joining or leaving a group chat change its metadata.
+spindle.on('CHAT_CHANGED', (payload, userId) => {
+  const event = payload as {
+    chatId?: string;
+    chat?: { id?: string; character_id?: string; metadata?: Record<string, unknown> };
+    changedFields?: string[];
+  };
+  const chatId = event?.chat?.id ?? event?.chatId;
+  if (!chatId) return;
+  const fields = event.changedFields;
+  if (fields && !fields.some((field) => /^metadata(\.(group|character_ids)\b|$)/.test(field))) return;
   void (async () => {
-    const characterId = event?.chatId ? await resolveChatCharacter(event.chatId, userId) : null;
-    send({ type: 'chat_context', chatId: event?.chatId ?? null, characterId }, userId);
+    const cast = event.chat?.metadata ? castFromChat(event.chat) : await resolveChatCast(chatId, userId);
+    if (cast) send({ type: 'chat_members', chatId, characterIds: cast.characterIds }, userId);
   })();
 });
 
