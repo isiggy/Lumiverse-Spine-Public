@@ -30,8 +30,10 @@ const STAGE_CSS = `
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
 /* Background mode: the host mounts the overlay at z-index 9990 above the whole
    app. Drop it to 0 so it sits above the app's backdrop and global wallpaper
-   but under <main> (z-index 1), which holds the chat. */
+   but under <main> (z-index 1), which holds the chat. While a chat is open the
+   overlay moves into the chat view instead (see placeOverlay). */
 html.spine-avatars-bg .spine-avatars-mount { z-index: 0 !important; }
+html.spine-avatars-bg .spine-avatars-overlay { z-index: 0; }
 `;
 
 // A jointed figure: bones and joints, the way a Spine rig is built.
@@ -110,7 +112,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   // ── Stage host: app overlay when permitted, tab preview otherwise ─────────
   const embeddedHost = document.createElement('div');
-  let overlayMount: { root: HTMLElement; destroy(): void } | null = null;
+  let overlayMount: { root: HTMLElement; mountRoot: HTMLElement; destroy(): void } | null = null;
   let overlayActive = false;
 
   const ensureStageHost = () => {
@@ -121,7 +123,14 @@ export function setup(ctx: SpindleFrontendContext) {
           const host = document.createElement('div');
           host.className = 'spine-avatars-overlay';
           mount.root.appendChild(host);
-          overlayMount = { root: host, destroy: () => mount.destroy() };
+          overlayMount = {
+            root: host,
+            mountRoot: mount.root,
+            destroy: () => {
+              host.remove();
+              mount.destroy();
+            },
+          };
           cleanups.push(() => overlayMount?.destroy());
         } catch (error) {
           console.debug('[spine] overlay mount unavailable:', error);
@@ -142,8 +151,56 @@ export function setup(ctx: SpindleFrontendContext) {
   const applyBackgroundMode = () => {
     const on = settings.global.enabled && settings.global.backgroundMode && overlayActive;
     document.documentElement.classList.toggle('spine-avatars-bg', on);
+    setOverlayTracking(on);
+    placeOverlay();
   };
   cleanups.push(() => document.documentElement.classList.remove('spine-avatars-bg'));
+
+  // In background mode the chat view draws its own wallpaper and scene image
+  // inside <main>, faded by the user's wallpaper opacity. Under <main> the model
+  // would show through that fade, so a fully opaque wallpaper hid it. Instead the
+  // overlay goes inside the chat view, just before the chat body: positioned at
+  // z-index 0 after the wallpaper and scene layers (also z-index 0), it paints
+  // above them and below the text scrim (1) and the chat itself (3).
+  const placeOverlay = () => {
+    if (!overlayMount) return;
+    const host = overlayMount.root;
+    const bgOn = document.documentElement.classList.contains('spine-avatars-bg');
+    // Fast path for the observer, which fires on every chat update: still in place.
+    const next = host.nextElementSibling;
+    if (bgOn && host.isConnected && next?.getAttribute('data-lumiverse-surface') === 'chat-body') return;
+    const chatBody = bgOn
+      ? document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]')
+      : null;
+    const target = chatBody?.parentElement ?? overlayMount.mountRoot;
+    if (host.parentElement === target && (!chatBody || host.nextElementSibling === chatBody)) return;
+    target.insertBefore(host, chatBody ?? null);
+  };
+
+  // Opening another chat or page replaces the chat view, so follow it.
+  let overlayObserver: MutationObserver | null = null;
+  let placeFrame: number | null = null;
+  const setOverlayTracking = (on: boolean) => {
+    if (on && !overlayObserver) {
+      overlayObserver = new MutationObserver(() => {
+        if (placeFrame !== null) return;
+        placeFrame = window.requestAnimationFrame(() => {
+          placeFrame = null;
+          placeOverlay();
+        });
+      });
+      overlayObserver.observe(document.querySelector('[data-app-root]') ?? document.body, {
+        childList: true,
+        subtree: true,
+      });
+    } else if (!on && overlayObserver) {
+      overlayObserver.disconnect();
+      overlayObserver = null;
+      if (placeFrame !== null) window.cancelAnimationFrame(placeFrame);
+      placeFrame = null;
+    }
+  };
+  cleanups.push(() => setOverlayTracking(false));
 
   // ── Settings tab ──────────────────────────────────────────────────────────
   let classifyPending: { resolve: (label: string) => void; reject: (error: Error) => void } | null = null;

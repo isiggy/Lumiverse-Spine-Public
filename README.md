@@ -20,7 +20,7 @@ Plays skeletons exported from **Spine 4.1** (binary `.skel` or `.json`), with th
   - X / Y offset sliders, or drag the model to move it.
 - **Animations**: pick the skin, the looping idle animation, an animation for when the chat opens (with delay), one for clicks (optionally sending a message into the chat, with *Auto-send interaction* to get a reply), and a talking animation layered on top while the character's message is "spoken" (duration scales with message length).
 - **Emotion-driven animation**: new character messages are classified into one of the 28 classic emotions (`joy`, `anger`, `surprise`, …) with a quiet LLM generation, and each emotion can be mapped to an animation, which plays once before the idle loop resumes. Emotions are mapped automatically on first load when the model has animations with matching names (`angry`, `sad`, `shy`, `surprise`, …). You can also reuse Lumiverse's own expression detection (`EXPRESSION_CHANGED`) or turn it off.
-- **Background mode**: a global toggle that draws the model behind the chat instead of over it. Needs `app_manipulation`. While it's on the chat takes the clicks, so dragging and clicking the model don't work.
+- **Background mode**: a global toggle that draws the model behind the chat instead of over it. Needs `app_manipulation`. While it's on the chat takes the clicks, so dragging and clicking the model don't work. The model is drawn over any chat wallpaper or scene background, so their opacity setting only fades the wallpaper.
 - **Debug**: draw bones and the model's reference bounds, and a reload button.
 - **Command palette**: `Spine: Open Settings`, `Spine: Reload Models`, `Spine: Toggle Enabled` (Ctrl/Cmd+K).
 
