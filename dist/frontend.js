@@ -12357,8 +12357,10 @@ var STAGE_CSS = `
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
 /* Background mode: the host mounts the overlay at z-index 9990 above the whole
    app. Drop it to 0 so it sits above the app's backdrop and global wallpaper
-   but under <main> (z-index 1), which holds the chat. */
+   but under <main> (z-index 1), which holds the chat. While a chat is open the
+   overlay moves into the chat view instead (see placeOverlay). */
 html.spine-avatars-bg .spine-avatars-mount { z-index: 0 !important; }
+html.spine-avatars-bg .spine-avatars-overlay { z-index: 0; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2"/><path d="M12 6.5v6.5"/><path d="M12 8.5l-4 2.5-1.5 3.5M12 8.5l4 2.5 1.5 3.5"/><path d="M12 13l-3 3.5L8 21M12 13l3 3.5 1 4.5"/><circle cx="12" cy="13" r=".8"/><circle cx="8" cy="11" r=".8"/><circle cx="16" cy="11" r=".8"/><circle cx="9" cy="16.5" r=".8"/><circle cx="15" cy="16.5" r=".8"/></svg>';
 function setup(ctx) {
@@ -12430,7 +12432,14 @@ function setup(ctx) {
           const host = document.createElement("div");
           host.className = "spine-avatars-overlay";
           mount.root.appendChild(host);
-          overlayMount = { root: host, destroy: () => mount.destroy() };
+          overlayMount = {
+            root: host,
+            mountRoot: mount.root,
+            destroy: () => {
+              host.remove();
+              mount.destroy();
+            }
+          };
           cleanups.push(() => overlayMount?.destroy());
         } catch (error) {
           console.debug("[spine] overlay mount unavailable:", error);
@@ -12450,8 +12459,49 @@ function setup(ctx) {
   const applyBackgroundMode = () => {
     const on = settings.global.enabled && settings.global.backgroundMode && overlayActive;
     document.documentElement.classList.toggle("spine-avatars-bg", on);
+    setOverlayTracking(on);
+    placeOverlay();
   };
   cleanups.push(() => document.documentElement.classList.remove("spine-avatars-bg"));
+  const placeOverlay = () => {
+    if (!overlayMount)
+      return;
+    const host = overlayMount.root;
+    const bgOn = document.documentElement.classList.contains("spine-avatars-bg");
+    const next = host.nextElementSibling;
+    if (bgOn && host.isConnected && next?.getAttribute("data-lumiverse-surface") === "chat-body")
+      return;
+    const chatBody = bgOn ? document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]') : null;
+    const target = chatBody?.parentElement ?? overlayMount.mountRoot;
+    if (host.parentElement === target && (!chatBody || host.nextElementSibling === chatBody))
+      return;
+    target.insertBefore(host, chatBody ?? null);
+  };
+  let overlayObserver = null;
+  let placeFrame = null;
+  const setOverlayTracking = (on) => {
+    if (on && !overlayObserver) {
+      overlayObserver = new MutationObserver(() => {
+        if (placeFrame !== null)
+          return;
+        placeFrame = window.requestAnimationFrame(() => {
+          placeFrame = null;
+          placeOverlay();
+        });
+      });
+      overlayObserver.observe(document.querySelector("[data-app-root]") ?? document.body, {
+        childList: true,
+        subtree: true
+      });
+    } else if (!on && overlayObserver) {
+      overlayObserver.disconnect();
+      overlayObserver = null;
+      if (placeFrame !== null)
+        window.cancelAnimationFrame(placeFrame);
+      placeFrame = null;
+    }
+  };
+  cleanups.push(() => setOverlayTracking(false));
   let classifyPending = null;
   const controller = {
     getSettings: () => settings,
