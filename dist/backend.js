@@ -2216,7 +2216,7 @@ var EMOTION_ANIMATION_HINTS = {
   surprise: ["surprise", "surprised", "shock"],
   neutral: []
 };
-var IDLE_ANIMATION_HINTS = ["idle", "idle_0", "idle_1", "idle01", "stand", "wait", "loop", "animation"];
+var IDLE_ANIMATION_HINTS = ["idle", "idle_0", "idle_1", "idle01", "stand", "wait", "loop", "animation", "normal"];
 var TALK_ANIMATION_HINTS = ["talk", "talk_start", "speak", "talking", "mouth"];
 var SETTINGS_LIMITS = {
   renderScale: { min: 0.25, max: 2, step: 0.05 },

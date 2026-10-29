@@ -85,7 +85,8 @@ export const EMOTION_ANIMATION_HINTS: Record<string, string[]> = {
   neutral: [],
 };
 
-export const IDLE_ANIMATION_HINTS = ['idle', 'idle_0', 'idle_1', 'idle01', 'stand', 'wait', 'loop', 'animation'];
+// 'normal' is the idle in Azur Lane models, a common source of Spine 3.8 models.
+export const IDLE_ANIMATION_HINTS = ['idle', 'idle_0', 'idle_1', 'idle01', 'stand', 'wait', 'loop', 'animation', 'normal'];
 export const TALK_ANIMATION_HINTS = ['talk', 'talk_start', 'speak', 'talking', 'mouth'];
 
 export interface StarterAnimation {
