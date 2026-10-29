@@ -18,16 +18,22 @@
  * - x / y move that center as a percent of half the column's size;
  * - render scale sets the canvas's backing resolution, not the model's size.
  *   With several models the canvas uses the highest of their render scales.
+ *
+ * Each model is read and drawn by the Spine runtime for its editor version
+ * (runtimes.ts). Models of different versions share the canvas: each runtime
+ * gets its own renderer on the same WebGL context.
  */
 
 import * as spine from '@esotericsoftware/spine-webgl';
 import type { ModelAssets, ModelBundle } from './assets';
 import { type Columns, SharedColumns, sameColumns } from './columns';
+import { type SpineRuntime, runtimeFor } from './runtimes';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
   type ModelDescription,
   type ModelRecord,
   type ModelSettings,
+  type SpineRuntimeVersion,
   type SpineSettings,
   SETTINGS_LIMITS,
 } from '../shared/settings';
@@ -65,13 +71,6 @@ const CONTEXT_RESTORE_WAIT_MS = 3000;
 /** How long a model has been on stage before its first thumbnail is taken (its idle pose has settled). */
 const THUMBNAIL_DELAY_MS = 1500;
 
-// The canvas is transparent and composited over the app. Additive slots (glows)
-// must not add alpha, or they'd darken the page behind them instead of
-// brightening it: keep the destination's alpha by using ZERO for the source's.
-(spine.PolygonBatcher as unknown as { blendModesGL: Array<{ srcAlpha: number }> }).blendModesGL[
-  spine.BlendMode.Additive
-]!.srcAlpha = 0; // GL_ZERO
-
 export interface StageDeps {
   getSettings(): SpineSettings;
   getModelRecord(modelId: string): ModelRecord | undefined;
@@ -97,8 +96,8 @@ interface Bounds {
   height: number;
 }
 
-interface Gl {
-  canvas: HTMLCanvasElement;
+/** One runtime's renderer on the shared canvas. */
+interface Renderer {
   context: spine.ManagedWebGLRenderingContext;
   shader: spine.Shader;
   batcher: spine.PolygonBatcher;
@@ -106,6 +105,13 @@ interface Gl {
   debugShader: spine.Shader | null;
   shapes: spine.ShapeRenderer | null;
   debugRenderer: spine.SkeletonDebugRenderer | null;
+}
+
+interface Gl {
+  canvas: HTMLCanvasElement;
+  context: WebGLRenderingContext;
+  /** Created the first time a model of that runtime's version is drawn. */
+  renderers: Map<SpineRuntimeVersion, Renderer>;
   mvp: spine.Matrix4;
   maxDimension: number;
   maxTextureSize: number;
@@ -117,6 +123,7 @@ interface LoadedEntry {
   characterId: string;
   modelId: string;
   description: ModelDescription;
+  runtime: SpineRuntime;
   atlas: spine.TextureAtlas;
   skeleton: spine.Skeleton;
   state: spine.AnimationState;
@@ -172,7 +179,7 @@ function bundleFile(bundle: ModelBundle, baseDir: string, file: string): Blob | 
   return undefined;
 }
 
-/** Stand-in texture for parsing a skeleton without a GL context. */
+/** Stand-in texture for parsing a skeleton without a GL context. Either runtime takes it. */
 class NullTexture extends spine.Texture {
   constructor(width: number, height: number) {
     super({ width, height } as unknown as HTMLImageElement);
@@ -186,15 +193,19 @@ class NullTexture extends spine.Texture {
  * Parse the atlas with stand-in textures: mesh attachments read their page's
  * size while the skeleton loads. The stage swaps in GL textures afterwards.
  */
-async function readAtlas(bundle: ModelBundle): Promise<spine.TextureAtlas> {
+async function readAtlas(runtime: SpineRuntime, bundle: ModelBundle): Promise<spine.TextureAtlas> {
   const text = await bundle.files.get(bundle.atlasFile)?.text();
   if (text === undefined) throw new Error(`Atlas missing from bundle: ${bundle.atlasFile}`);
-  const atlas = new spine.TextureAtlas(text);
+  const atlas = runtime.readAtlas(text);
   for (const page of atlas.pages) page.setTexture(new NullTexture(page.width || 1, page.height || 1));
   return atlas;
 }
 
-async function readSkeletonData(bundle: ModelBundle, atlas: spine.TextureAtlas): Promise<spine.SkeletonData> {
+async function readSkeletonData(
+  { spine }: SpineRuntime,
+  bundle: ModelBundle,
+  atlas: spine.TextureAtlas,
+): Promise<spine.SkeletonData> {
   const file = bundle.files.get(bundle.skeletonFile);
   if (!file) throw new Error(`Skeleton missing from bundle: ${bundle.skeletonFile}`);
   const loader = new spine.AtlasAttachmentLoader(atlas);
@@ -214,6 +225,7 @@ function describeSkeleton(data: spine.SkeletonData, atlas: spine.TextureAtlas, r
 
 /** Run `visit` with the world-space triangles of every visible region and mesh attachment. */
 function forEachVisibleTriangle(
+  { spine }: SpineRuntime,
   skeleton: spine.Skeleton,
   visit: (vertices: ArrayLike<number>, triangles: ArrayLike<number>) => boolean | void,
 ): void {
@@ -240,12 +252,12 @@ function forEachVisibleTriangle(
   }
 }
 
-function visibleBounds(skeleton: spine.Skeleton): Bounds | null {
+function visibleBounds(runtime: SpineRuntime, skeleton: spine.Skeleton): Bounds | null {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  forEachVisibleTriangle(skeleton, (vertices) => {
+  forEachVisibleTriangle(runtime, skeleton, (vertices) => {
     for (let i = 0; i + 1 < vertices.length; i += 2) {
       const x = vertices[i]!;
       const y = vertices[i + 1]!;
@@ -283,7 +295,8 @@ function setPageSize(page: spine.TextureAtlasPage, width: number, height: number
  * one), with the configured skin. Measured on a scratch skeleton so the one on
  * stage keeps its pose.
  */
-function measureReferenceBounds(data: spine.SkeletonData, settings: ModelSettings): Bounds {
+function measureReferenceBounds(runtime: SpineRuntime, data: spine.SkeletonData, settings: ModelSettings): Bounds {
+  const { spine } = runtime;
   const skeleton = new spine.Skeleton(data);
   const skin = (settings.skin && data.findSkin(settings.skin)) || data.defaultSkin;
   if (skin) skeleton.setSkin(skin);
@@ -291,10 +304,33 @@ function measureReferenceBounds(data: spine.SkeletonData, settings: ModelSetting
   const idle = settings.animation_idle !== 'none' ? data.findAnimation(settings.animation_idle) : null;
   if (idle) idle.apply(skeleton, 0, 0, false, [], 1, spine.MixBlend.setup, spine.MixDirection.mixIn);
   skeleton.updateWorldTransform();
-  const bounds = visibleBounds(skeleton);
+  const bounds = visibleBounds(runtime, skeleton);
   if (bounds) return bounds;
   if (data.width > 0 && data.height > 0) return { x: data.x, y: data.y, width: data.width, height: data.height };
   return { x: -50, y: 0, width: 100, height: 100 };
+}
+
+/**
+ * A runtime's shader, batcher and skeleton renderer for the canvas. Every
+ * runtime asks the canvas for the same WebGL context, so they share it.
+ */
+function createRenderer({ spine }: SpineRuntime, canvas: HTMLCanvasElement): Renderer {
+  const context = new spine.ManagedWebGLRenderingContext(canvas, {
+    alpha: true,
+    premultipliedAlpha: true,
+    antialias: true,
+    preserveDrawingBuffer: false,
+  });
+  if (!context.gl) throw new Error('WebGL is unavailable in this browser.');
+  return {
+    context,
+    shader: spine.Shader.newTwoColoredTextured(context),
+    batcher: new spine.PolygonBatcher(context, true),
+    renderer: new spine.SkeletonRenderer(context, true),
+    debugShader: null,
+    shapes: null,
+    debugRenderer: null,
+  };
 }
 
 function pointInTriangle(
@@ -480,31 +516,20 @@ export class Stage {
     );
   }
 
-  private createGl(host: HTMLElement): Gl {
+  private createGl(host: HTMLElement, runtime: SpineRuntime): Gl {
     const canvas = document.createElement('canvas');
     canvas.className = 'spine-avatars-canvas';
     host.appendChild(canvas);
     try {
-      const context = new spine.ManagedWebGLRenderingContext(canvas, {
-        alpha: true,
-        premultipliedAlpha: true,
-        antialias: true,
-        preserveDrawingBuffer: false,
-      });
-      if (!context.gl) throw new Error('WebGL is unavailable in this browser.');
-      const gl = context.gl;
+      const first = createRenderer(runtime, canvas);
+      const gl = first.context.gl;
       const maxViewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS) as Int32Array | null;
       const maxRenderbuffer = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) as number;
       const result: Gl = {
         canvas,
-        context,
-        shader: spine.Shader.newTwoColoredTextured(context),
-        batcher: new spine.PolygonBatcher(context, true),
-        renderer: new spine.SkeletonRenderer(context, true),
-        debugShader: null,
-        shapes: null,
-        debugRenderer: null,
-        mvp: new spine.Matrix4(),
+        context: gl,
+        renderers: new Map([[runtime.version, first]]),
+        mvp: new runtime.spine.Matrix4(),
         maxDimension: Math.max(256, Math.min(maxRenderbuffer || 4096, maxViewport?.[0] ?? 4096, 8192)),
         maxTextureSize: (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096,
         restoreTimer: null,
@@ -547,7 +572,8 @@ export class Stage {
     token: number,
   ): Promise<void> {
     const host = this.host!;
-    const atlas = await readAtlas(bundle);
+    const runtime = runtimeFor(record);
+    const atlas = await readAtlas(runtime, bundle);
 
     // Decode every atlas page before touching GL, so a cancelled load leaves nothing behind.
     const atlasDir = dirname(bundle.atlasFile);
@@ -566,7 +592,7 @@ export class Stage {
         if (!page.width || !page.height) setPageSize(page, image.width, image.height);
       }
       if (cancelled()) return closeImages();
-      data = await readSkeletonData(bundle, atlas);
+      data = await readSkeletonData(runtime, bundle, atlas);
     } catch (error) {
       closeImages();
       throw error;
@@ -579,15 +605,17 @@ export class Stage {
 
     // The models share one canvas: the first one ready creates it.
     let gl = this.gl;
-    if (!gl) {
-      try {
-        gl = this.createGl(host);
-      } catch (error) {
-        closeImages();
-        throw error;
+    let renderer: Renderer;
+    try {
+      if (!gl) {
+        gl = this.createGl(host, runtime);
+        this.gl = gl;
+        this.observeSize(gl.canvas);
       }
-      this.gl = gl;
-      this.observeSize(gl.canvas);
+      renderer = this.rendererFor(gl, runtime);
+    } catch (error) {
+      closeImages();
+      throw error;
     }
     const textures: spine.GLTexture[] = [];
     try {
@@ -599,7 +627,7 @@ export class Stage {
               `${gl.maxTextureSize}px texture limit; it may draw black.`,
           );
         }
-        const texture = new spine.GLTexture(gl.context, image);
+        const texture = new runtime.spine.GLTexture(renderer.context, image);
         textures.push(texture);
         page.setTexture(texture);
       });
@@ -610,16 +638,17 @@ export class Stage {
       throw error;
     }
 
-    const skeleton = new spine.Skeleton(data);
-    const stateData = new spine.AnimationStateData(data);
+    const skeleton = new runtime.spine.Skeleton(data);
+    const stateData = new runtime.spine.AnimationStateData(data);
     stateData.defaultMix = DEFAULT_MIX;
     const entry: LoadedEntry = {
       characterId,
       modelId: record.id,
       description,
+      runtime,
       atlas,
       skeleton,
-      state: new spine.AnimationState(stateData),
+      state: new runtime.spine.AnimationState(stateData),
       bounds: { x: 0, y: 0, width: 1, height: 1 },
       textures,
       talkTimer: null,
@@ -631,7 +660,7 @@ export class Stage {
     this.sortEntries();
     this.applySkinTo(entry, modelSettings);
     this.startIdle(entry, modelSettings);
-    entry.bounds = measureReferenceBounds(data, modelSettings);
+    entry.bounds = measureReferenceBounds(runtime, data, modelSettings);
 
     if (this.frameRequest === null) {
       this.lastFrameTime = performance.now();
@@ -668,17 +697,17 @@ export class Stage {
     const entry = this.entryFor(characterId);
     const width = this.hostWidth;
     const height = this.hostHeight;
-    if (!gl || !entry || width === 0 || height === 0 || gl.context.gl.isContextLost()) return null;
+    if (!gl || !entry || width === 0 || height === 0 || gl.context.isContextLost()) return null;
     const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, gl.canvas.width, gl.canvas.height);
     if (pixels < 32) return null;
     // The square in host CSS pixels, and the model's current pose fitted into it.
     const box = (pixels * width) / gl.canvas.width;
-    const bounds = visibleBounds(entry.skeleton) ?? entry.bounds;
+    const bounds = visibleBounds(entry.runtime, entry.skeleton) ?? entry.bounds;
     const scale = (box * 0.96) / Math.max(bounds.width, bounds.height);
     const centerX = bounds.x + bounds.width / 2;
     const centerY = bounds.y + bounds.height / 2;
     const fitted: Affine = { a: scale, b: 0, c: 0, d: -scale, e: box / 2 - scale * centerX, f: box / 2 + scale * centerY };
-    const context = gl.context.gl;
+    const context = gl.context;
     try {
       context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
       context.clearColor(0, 0, 0, 0);
@@ -741,7 +770,7 @@ export class Stage {
 
     const width = this.hostWidth;
     const height = this.hostHeight;
-    if (width === 0 || height === 0 || gl.context.gl.isContextLost()) return;
+    if (width === 0 || height === 0 || gl.context.isContextLost()) return;
     this.resizeCanvas(gl, width, height, renderScale);
     this.draw(gl, drawn, width, height);
   };
@@ -769,7 +798,7 @@ export class Stage {
     width: number,
     height: number,
   ): void {
-    const context = gl.context.gl;
+    const context = gl.context;
     // The browser may give the canvas a smaller buffer than asked for; draw into what it has.
     context.viewport(0, 0, context.drawingBufferWidth, context.drawingBufferHeight);
     context.clearColor(0, 0, 0, 0);
@@ -801,29 +830,42 @@ export class Stage {
     m[spine.M22] = 1;
     m[spine.M33] = 1;
 
-    gl.shader.bind();
-    gl.shader.setUniformi(spine.Shader.SAMPLER, 0);
-    gl.shader.setUniform4x4f(spine.Shader.MVP_MATRIX, m);
-    gl.renderer.premultipliedAlpha = settings.premultipliedAlpha;
-    gl.batcher.begin(gl.shader);
-    gl.renderer.draw(gl.batcher, entry.skeleton);
-    gl.batcher.end();
-    gl.shader.unbind();
+    const r = this.rendererFor(gl, entry.runtime);
+    r.shader.bind();
+    r.shader.setUniformi(spine.Shader.SAMPLER, 0);
+    r.shader.setUniform4x4f(spine.Shader.MVP_MATRIX, m);
+    r.renderer.premultipliedAlpha = settings.premultipliedAlpha;
+    r.batcher.begin(r.shader);
+    r.renderer.draw(r.batcher, entry.skeleton);
+    r.batcher.end();
+    r.shader.unbind();
+  }
+
+  /** The renderer for a runtime's models, created on first use. */
+  private rendererFor(gl: Gl, runtime: SpineRuntime): Renderer {
+    let renderer = gl.renderers.get(runtime.version);
+    if (!renderer) {
+      renderer = createRenderer(runtime, gl.canvas);
+      gl.renderers.set(runtime.version, renderer);
+    }
+    return renderer;
   }
 
   private drawDebug(gl: Gl, entry: LoadedEntry, mvp: Float32Array): void {
-    if (!gl.debugShader) {
-      gl.debugShader = spine.Shader.newColored(gl.context);
-      gl.shapes = new spine.ShapeRenderer(gl.context);
-      gl.debugRenderer = new spine.SkeletonDebugRenderer(gl.context);
-      gl.debugRenderer.drawMeshTriangles = false;
+    const { spine } = entry.runtime;
+    const r = this.rendererFor(gl, entry.runtime);
+    if (!r.debugShader) {
+      r.debugShader = spine.Shader.newColored(r.context);
+      r.shapes = new spine.ShapeRenderer(r.context);
+      r.debugRenderer = new spine.SkeletonDebugRenderer(r.context);
+      r.debugRenderer.drawMeshTriangles = false;
     }
-    const shader = gl.debugShader;
-    const shapes = gl.shapes!;
+    const shader = r.debugShader;
+    const shapes = r.shapes!;
     shader.bind();
     shader.setUniform4x4f(spine.Shader.MVP_MATRIX, mvp);
     shapes.begin(shader);
-    gl.debugRenderer!.draw(shapes, entry.skeleton);
+    r.debugRenderer!.draw(shapes, entry.skeleton);
     const { x, y, width, height } = entry.bounds;
     shapes.setColor(new spine.Color(1, 0.6, 0, 1));
     shapes.rect(false, x, y, width, height);
@@ -922,7 +964,7 @@ export class Stage {
     if (!entry) return;
     const settings = this.settingsFor(entry);
     this.applySkinTo(entry, settings);
-    entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
+    entry.bounds = measureReferenceBounds(entry.runtime, entry.skeleton.data, settings);
   }
 
   /** Switch to the idle animation after the setting changes. The reference bounds follow it, as on the next load. */
@@ -931,7 +973,7 @@ export class Stage {
     if (!entry) return;
     const settings = this.settingsFor(entry);
     this.startIdle(entry, settings);
-    entry.bounds = measureReferenceBounds(entry.skeleton.data, settings);
+    entry.bounds = measureReferenceBounds(entry.runtime, entry.skeleton.data, settings);
   }
 
   /** Play an animation once on a character's base track, then go back to idling. */
@@ -975,9 +1017,10 @@ export class Stage {
     const key = `${record.id}@${record.version}`;
     const cached = this.descriptionCache.get(key);
     if (cached) return cached;
+    const runtime = runtimeFor(record);
     const bundle = await this.deps.assets.load(record);
-    const atlas = await readAtlas(bundle);
-    const data = await readSkeletonData(bundle, atlas);
+    const atlas = await readAtlas(runtime, bundle);
+    const data = await readSkeletonData(runtime, bundle, atlas);
     const description = describeSkeleton(data, atlas, record);
     this.descriptionCache.set(key, description);
     return description;
@@ -1017,7 +1060,7 @@ export class Stage {
     if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return false;
     let hit = false;
     try {
-      forEachVisibleTriangle(entry.skeleton, (vertices, triangles) => {
+      forEachVisibleTriangle(entry.runtime, entry.skeleton, (vertices, triangles) => {
         for (let i = 0; i + 2 < triangles.length; i += 3) {
           const p = triangles[i]! * 2;
           const q = triangles[i + 1]! * 2;
@@ -1197,17 +1240,19 @@ export class Stage {
     this.gl = null;
     if (gl) {
       if (gl.restoreTimer !== null) window.clearTimeout(gl.restoreTimer);
-      for (const disposable of [gl.batcher, gl.shader, gl.debugShader, gl.shapes]) {
-        try {
-          disposable?.dispose();
-        } catch {
-          /* context already lost */
+      for (const renderer of gl.renderers.values()) {
+        for (const disposable of [renderer.batcher, renderer.shader, renderer.debugShader, renderer.shapes]) {
+          try {
+            disposable?.dispose();
+          } catch {
+            /* context already lost */
+          }
         }
       }
       // Free the GPU context now instead of whenever the canvas is collected;
       // browsers cap how many live WebGL contexts a page may hold.
       try {
-        gl.context.gl.getExtension('WEBGL_lose_context')?.loseContext();
+        gl.context.getExtension('WEBGL_lose_context')?.loseContext();
       } catch {
         /* unsupported */
       }

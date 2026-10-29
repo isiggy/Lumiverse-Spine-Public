@@ -35,8 +35,19 @@ export const CLASSIFY_EXPRESSIONS = [
   'neutral',
 ] as const;
 
-/** The Spine editor version (major.minor) the bundled runtime reads. */
-export const SUPPORTED_SPINE_VERSION = '4.1';
+/**
+ * The Spine editor versions (major.minor) the bundled runtimes read: each
+ * version has its own skeleton format, and the stage picks the runtime that
+ * matches the model's version.
+ */
+export const SUPPORTED_SPINE_VERSIONS = ['4.1', '3.8'] as const;
+export type SpineRuntimeVersion = (typeof SUPPORTED_SPINE_VERSIONS)[number];
+
+/** The runtime that plays skeletons exported from this editor version (e.g. "3.8.99"), or null. */
+export function spineRuntimeFor(version: string): SpineRuntimeVersion | null {
+  const majorMinor = version.split('.').slice(0, 2).join('.');
+  return SUPPORTED_SPINE_VERSIONS.find((supported) => supported === majorMinor) ?? null;
+}
 
 /**
  * Animation names commonly used for each emotion. On a model's first load,
@@ -148,7 +159,7 @@ export interface ModelRecord {
   skeletonFile: string;
   /** Path of the atlas file inside the model folder */
   atlasFile: string;
-  /** Spine editor version the skeleton was exported with, e.g. "4.1.20" */
+  /** Spine editor version the skeleton was exported with, e.g. "4.1.20" or "3.8.99" */
   spineVersion: string;
   /** The atlas's `pma` flag: textures are stored premultiplied by alpha */
   pma: boolean;

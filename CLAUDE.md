@@ -12,7 +12,9 @@ A Spindle extension for Lumiverse that shows Spine models as character avatars. 
 - The Character model dropdowns are Lumiverse's own searchable select (`ctx.components.mountSelect`), mounted after each render into placeholders and destroyed on the next; e2e drives them by clicking the trigger and the `[role="option"]` rows.
 - `dist/` is committed, because Lumiverse installs straight from the repo. Rebuild before committing source changes.
 
-The Spine runtime is the npm package `@esotericsoftware/spine-webgl`, pinned to 4.1.x and bundled into `dist/frontend.js`. Each Spine editor version has its own binary format, so the runtime's major.minor must match `SUPPORTED_SPINE_VERSION` in `src/shared/settings.ts`, which the import check uses.
+Each Spine editor version has its own skeleton format, so there's a runtime per supported version, both bundled into `dist/frontend.js`: the npm package `@esotericsoftware/spine-webgl` pinned to 4.1.x, and spine-ts 3.8 vendored as `vendor/spine-webgl-3.8.js` (it isn't on npm). `SUPPORTED_SPINE_VERSIONS` in `src/shared/settings.ts` lists them; the import check uses it, and the stage picks a model's runtime from its `spineVersion`.
+
+`src/frontend/runtimes.ts` types the 3.8 namespace as 4.1's and patches 3.8 where it differs, so the stage's code works with either: atlases are always parsed by 4.1's parser (3.8's can't read a 4.x-style atlas, which 3.8 models often come with) and copied into 3.8's classes, 3.8 pages get `setTexture()`, `RegionAttachment.computeWorldVertices` takes the slot, and 3.8's batcher blends alpha like 4.1's. Each runtime gets its own renderer on the canvas's one WebGL context. When the stage starts using a runtime feature it didn't use before, check that 3.8 has it with the same signature.
 
 ## How the stage lays out a model
 
@@ -52,13 +54,13 @@ scripts/dev/lumiverse.sh e2e      # headless: create a chat, import and bind spi
 - `e2e --library` then tests the model library (thumbnail, sorting, filter, tiles and list, persistence), search in the model dropdown, and settings file export and import. It imports six copies of the model zip under other names, so the dropdown has enough options to show its search field.
 - `e2e --slow` sends the browser's traffic through a 3 MB/s proxy (`scripts/dev/throttle-proxy.mjs`), like a remote user. Use it for anything that touches model downloads.
 
-Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and chat only), `models` (downloads spineboy, a Spine 4.1 example, to `$LUMI_WORK/models/`). `export` the variable rather than prefixing one command, since every command reads it.
+Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and chat only), `models` (downloads spineboy, a Spine 4.1 example, to `$LUMI_WORK/models/`; there's no 3.8 test model to download, ask for one). `export` the variable rather than prefixing one command, since every command reads it.
 
 ### Pitfalls the script handles (don't rediscover them)
 
 - **Old Bun.** The preinstalled Bun may be older than the 1.4 Lumiverse needs, and `bun.sh` is blocked by the network proxy, so the script downloads Bun from GitHub releases.
 - **Extension backend crashes with `TypeError: Unable to deserialize data`.** Lumiverse runs extension backends with `bun` from PATH, and the IPC handshake between Bun versions fails. The script sets `LUMIVERSE_BUN_METHOD=direct` and `LUMIVERSE_BUN_PATH` so they use the same Bun as the server.
-- **`EAFNOSUPPORT` on listen.** Lumiverse binds `::` and the container has no IPv6. The script patches `src/main.ts` to bind `0.0.0.0`.
+- **`EAFNOSUPPORT` on listen.** Lumiverse binds `::` and the container has no IPv6. The script sets `LUMIVERSE_HOST=0.0.0.0`, which newer Lumiverse reads, and patches `src/main.ts` to bind `0.0.0.0` on versions that hard-code `::`.
 - **Server exits asking for the setup wizard.** It needs `OWNER_PASSWORD` (and `OWNER_USERNAME`) on first boot to create the owner account.
 - **Stopping the server.** Use `lumiverse.sh stop`, which kills the saved PID. `pkill -f "src/index.ts"` also matches the Bash tool's own shell command and kills it.
 - **REST quirks.** Log in with `POST /api/auth/sign-in/username` and keep the cookie. `GET /api/v1/spindle/` with a trailing slash returns the web app's HTML.
@@ -76,6 +78,6 @@ Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and c
 
 ## Reference
 
-docs.lumiverse.chat is blocked by the network proxy. The same docs are in the Lumiverse repo under `developer-docs/docs/`, at `$LUMI_WORK/Lumiverse` after `setup`. The Spine 4.1 runtime source is in `node_modules/@esotericsoftware/spine-core` and `spine-webgl` (`dist/*.js` are readable ES modules).
+docs.lumiverse.chat is blocked by the network proxy. The same docs are in the Lumiverse repo under `developer-docs/docs/`, at `$LUMI_WORK/Lumiverse` after `setup`. The Spine 4.1 runtime source is in `node_modules/@esotericsoftware/spine-core` and `spine-webgl` (`dist/*.js` are readable ES modules); the 3.8 one is `vendor/spine-webgl-3.8.js`.
 
 - Messages: Lumiverse documents a `CHARACTER_MESSAGE_RENDERED` event but never emits it. A reply's message is created once it has finished streaming (`MESSAGE_SENT`) and a regenerated reply arrives as `MESSAGE_SWIPED` with `action: 'added'`. In a group chat the message's `extra.character_id` names the member who wrote it (`extra.greeting_character_id` for greetings).

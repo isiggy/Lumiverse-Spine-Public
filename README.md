@@ -2,7 +2,7 @@
 
 A [Spindle](https://docs.lumiverse.chat/) extension for [Lumiverse](https://github.com/prolix-oc/Lumiverse) that shows **Spine animated models** as character avatars. It's the Spine counterpart of [Live2D Avatars for Lumiverse](https://github.com/isiggy/Lumiverse-Live2d-Public) and works the same way: import a model, bind it to a character, and it appears when you open that character's chat.
 
-Plays skeletons exported from **Spine 4.1** (binary `.skel` or `.json`), with their `.atlas` and page images.
+Plays skeletons exported from **Spine 4.1 or 3.8** (binary `.skel` or `.json`), with their `.atlas` and page images. Each model is drawn by the runtime for its version, picked automatically, so a group chat can mix 4.1 and 3.8 models.
 
 ## Features
 
@@ -59,7 +59,7 @@ The extension works with whatever you grant and degrades gracefully:
 ## How it works
 
 - **Backend** (`dist/backend.js`, Bun worker): stores settings and model files in extension user storage, unpacks ZIPs with [fflate](https://github.com/101arrowz/fflate), checks the skeleton's Spine version, sends model files to the browser in 1 MB chunks the browser asks for a few at a time, classifies emotions with `spindle.generate.quiet`, and relays chat events.
-- **Frontend** (`dist/frontend.js`): draws the skeleton with the official [spine-webgl](https://github.com/EsotericSoftware/spine-runtimes/tree/4.1/spine-ts) 4.1 runtime on a WebGL canvas in an app overlay (`ctx.ui.mountApp`) or the drawer tab. The overlay is a `position: fixed`, `pointer-events: none` canvas, so it never blocks the app; clicks and drags are picked up at the document level and go to the model only when they land on one of its visible parts with nothing drawn above it.
+- **Frontend** (`dist/frontend.js`): draws the skeleton with the official [spine-webgl](https://github.com/EsotericSoftware/spine-runtimes/tree/4.1/spine-ts) 4.1 runtime, or for Spine 3.8 models the [spine-ts 3.8](https://github.com/EsotericSoftware/spine-runtimes/tree/3.8/spine-ts) one, on a WebGL canvas in an app overlay (`ctx.ui.mountApp`) or the drawer tab. The overlay is a `position: fixed`, `pointer-events: none` canvas, so it never blocks the app; clicks and drags are picked up at the document level and go to the model only when they land on one of its visible parts with nothing drawn above it.
 
 ## Development
 
@@ -73,11 +73,11 @@ To try the extension in a real local Lumiverse instance (Linux), use `scripts/de
 
 ## Third-party runtime
 
-`dist/frontend.js` bundles `@esotericsoftware/spine-webgl` and `@esotericsoftware/spine-core` 4.1, © Esoteric Software, under the [Spine Runtimes License](https://esotericsoftware.com/spine-runtimes-license), whose full text is in `LICENSE-spine-runtimes`. Under that license, integrating the runtimes into software is permitted for holders of a Spine Editor license; read the license for the exact terms before distributing this extension. Spine is a trademark of Esoteric Software. This project is not affiliated with Esoteric Software.
+`dist/frontend.js` bundles `@esotericsoftware/spine-webgl` and `@esotericsoftware/spine-core` 4.1 and spine-ts 3.8 (`vendor/spine-webgl-3.8.js`), © Esoteric Software, under the [Spine Runtimes License](https://esotericsoftware.com/spine-runtimes-license), whose full text is in `LICENSE-spine-runtimes`. Under that license, integrating the runtimes into software is permitted for holders of a Spine Editor license; read the license for the exact terms before distributing this extension. Spine is a trademark of Esoteric Software. This project is not affiliated with Esoteric Software.
 
 ## Known limitations
 
-- Spine 4.1 skeletons only. Other versions are rejected at import with a message naming the version; the binary formats differ between Spine versions.
+- Spine 4.1 and 3.8 skeletons only. Other versions are rejected at import with a message naming the version; the binary formats differ between Spine versions.
 - Clicks hit-test the model's region and mesh shapes, so fully transparent areas inside a part still count as the model.
 
 ## License

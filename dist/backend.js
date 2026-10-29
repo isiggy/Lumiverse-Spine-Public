@@ -2181,7 +2181,11 @@ var CLASSIFY_EXPRESSIONS = [
   "surprise",
   "neutral"
 ];
-var SUPPORTED_SPINE_VERSION = "4.1";
+var SUPPORTED_SPINE_VERSIONS = ["4.1", "3.8"];
+function spineRuntimeFor(version) {
+  const majorMinor = version.split(".").slice(0, 2).join(".");
+  return SUPPORTED_SPINE_VERSIONS.find((supported) => supported === majorMinor) ?? null;
+}
 var EMOTION_ANIMATION_HINTS = {
   admiration: ["admiration", "delight", "happy", "joy", "smile"],
   amusement: ["amusement", "laugh", "delight", "happy", "smile"],
@@ -2467,9 +2471,6 @@ function jsonSkeletonVersion(data) {
     return null;
   }
 }
-function majorMinor(version) {
-  return version.split(".").slice(0, 2).join(".");
-}
 function findSkeleton(files) {
   const atlases = files.filter((file) => ATLAS.test(file.path));
   const skeletons = [];
@@ -2487,14 +2488,14 @@ function findSkeleton(files) {
   }
   if (atlases.length === 0)
     return { error: "No Spine atlas (*.atlas) found in the archive." };
-  const playable = skeletons.filter((skeleton) => skeleton.version !== null && majorMinor(skeleton.version) === SUPPORTED_SPINE_VERSION);
+  const playable = skeletons.filter((skeleton) => skeleton.version !== null && spineRuntimeFor(skeleton.version) !== null);
   if (playable.length === 0) {
     const versioned = skeletons.find((skeleton) => skeleton.version !== null);
     if (!versioned) {
       return { error: `Couldn't read the Spine version of ${skeletons[0].path}; is it a Spine skeleton?` };
     }
     return {
-      error: `${versioned.path} was exported from Spine ${versioned.version}. ` + `This extension plays Spine ${SUPPORTED_SPINE_VERSION}.x skeletons only.`
+      error: `${versioned.path} was exported from Spine ${versioned.version}. ` + `This extension plays Spine ${SUPPORTED_SPINE_VERSIONS.map((version) => `${version}.x`).join(" and ")} skeletons only.`
     };
   }
   const depth = (path) => path.split("/").length;
