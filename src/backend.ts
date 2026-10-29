@@ -23,7 +23,8 @@ import type {
 } from './shared/protocol';
 import {
   CLASSIFY_EXPRESSIONS,
-  SUPPORTED_SPINE_VERSION,
+  SUPPORTED_SPINE_VERSIONS,
+  spineRuntimeFor,
   type ModelRecord,
   type SpineSettings,
   normalizeSettings,
@@ -191,13 +192,9 @@ interface SkeletonChoice {
   pma: boolean;
 }
 
-function majorMinor(version: string): string {
-  return version.split('.').slice(0, 2).join('.');
-}
-
 /**
- * Pick the skeleton to use and the atlas that goes with it. Only skeletons the
- * runtime can play are considered. The atlas is, in order of preference: the
+ * Pick the skeleton to use and the atlas that goes with it. Only skeletons a
+ * bundled runtime can play are considered. The atlas is, in order of preference: the
  * one with the same name in the same folder, the same name anywhere, any in
  * the same folder, then any at all.
  */
@@ -217,7 +214,7 @@ function findSkeleton(files: Array<{ path: string; data: Uint8Array }>): Skeleto
   if (atlases.length === 0) return { error: 'No Spine atlas (*.atlas) found in the archive.' };
 
   const playable = skeletons.filter(
-    (skeleton) => skeleton.version !== null && majorMinor(skeleton.version) === SUPPORTED_SPINE_VERSION,
+    (skeleton) => skeleton.version !== null && spineRuntimeFor(skeleton.version) !== null,
   );
   if (playable.length === 0) {
     const versioned = skeletons.find((skeleton) => skeleton.version !== null);
@@ -227,7 +224,7 @@ function findSkeleton(files: Array<{ path: string; data: Uint8Array }>): Skeleto
     return {
       error:
         `${versioned.path} was exported from Spine ${versioned.version}. ` +
-        `This extension plays Spine ${SUPPORTED_SPINE_VERSION}.x skeletons only.`,
+        `This extension plays Spine ${SUPPORTED_SPINE_VERSIONS.map((version) => `${version}.x`).join(' and ')} skeletons only.`,
     };
   }
 

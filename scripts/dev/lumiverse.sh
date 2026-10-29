@@ -74,11 +74,12 @@ cmd_setup() {
     git clone -q --depth 1 https://github.com/prolix-oc/Lumiverse.git "$LUMI"
   fi
 
-  # The container has no IPv6, so binding "::" fails with EAFNOSUPPORT.
+  # The container has no IPv6, so binding "::" fails with EAFNOSUPPORT. Newer
+  # Lumiverse reads the address from LUMIVERSE_HOST, which `start` sets.
   if grep -q 'hostname: "::"' "$LUMI/src/main.ts"; then
     sed -i 's/hostname: "::"/hostname: "0.0.0.0"/' "$LUMI/src/main.ts"
     log "Patched src/main.ts to listen on 0.0.0.0"
-  elif ! grep -q 'hostname: "0.0.0.0"' "$LUMI/src/main.ts"; then
+  elif ! grep -q 'hostname: "0.0.0.0"\|LUMIVERSE_HOST' "$LUMI/src/main.ts"; then
     log "WARNING: couldn't find the Bun.serve hostname in src/main.ts; if start fails with EAFNOSUPPORT, set it to \"0.0.0.0\" by hand."
   fi
 
@@ -107,10 +108,11 @@ cmd_start() {
   # ("TypeError: Unable to deserialize data") and the extension backend exits.
   # OWNER_PASSWORD creates the owner account on first boot (otherwise the server
   # exits asking for the setup wizard). TRUSTED_ORIGINS adds the `e2e --slow`
-  # proxy port, or logins through it are rejected.
+  # proxy port, or logins through it are rejected. LUMIVERSE_HOST avoids binding
+  # "::" (no IPv6 here).
   (
     cd "$LUMI"
-    DATA_DIR="$DATA" FRONTEND_DIR="$LUMI/frontend/dist" PORT="$PORT" \
+    DATA_DIR="$DATA" FRONTEND_DIR="$LUMI/frontend/dist" PORT="$PORT" LUMIVERSE_HOST=0.0.0.0 \
       TRUSTED_ORIGINS="http://localhost:$PORT,http://127.0.0.1:$PORT,http://127.0.0.1:$SLOW_PORT" \
       OWNER_USERNAME="$USER_NAME" OWNER_PASSWORD="$USER_PASS" \
       LUMIVERSE_BUN_METHOD=direct LUMIVERSE_BUN_PATH="$BUN" PATH="$BUN_DIR:$PATH" \
