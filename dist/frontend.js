@@ -25524,7 +25524,7 @@ html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; 
    but under <main> (z-index 1), which holds the chat. While a chat is open the
    overlay moves into the chat view instead (see placeOverlay). */
 html.spine-avatars-bg .spine-avatars-mount { z-index: 0 !important; }
-html.spine-avatars-bg .spine-avatars-overlay { z-index: 0; }
+html.spine-avatars-bg .spine-avatars-overlay { z-index: 1; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2"/><path d="M12 6.5v6.5"/><path d="M12 8.5l-4 2.5-1.5 3.5M12 8.5l4 2.5 1.5 3.5"/><path d="M12 13l-3 3.5L8 21M12 13l3 3.5 1 4.5"/><circle cx="12" cy="13" r=".8"/><circle cx="8" cy="11" r=".8"/><circle cx="16" cy="11" r=".8"/><circle cx="9" cy="16.5" r=".8"/><circle cx="15" cy="16.5" r=".8"/></svg>';
 function downloadJson(fileName, value) {

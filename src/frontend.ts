@@ -35,7 +35,7 @@ html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; 
    but under <main> (z-index 1), which holds the chat. While a chat is open the
    overlay moves into the chat view instead (see placeOverlay). */
 html.spine-avatars-bg .spine-avatars-mount { z-index: 0 !important; }
-html.spine-avatars-bg .spine-avatars-overlay { z-index: 0; }
+html.spine-avatars-bg .spine-avatars-overlay { z-index: 1; }
 `;
 
 // A jointed figure: bones and joints, the way a Spine rig is built.
@@ -180,9 +180,11 @@ export function setup(ctx: SpindleFrontendContext) {
   // In background mode the chat view draws its own wallpaper and scene image
   // inside <main>, faded by the user's wallpaper opacity. Under <main> the model
   // would show through that fade, so a fully opaque wallpaper hid it. Instead the
-  // overlay goes inside the chat view, just before the chat body: positioned at
-  // z-index 0 after the wallpaper and scene layers (also z-index 0), it paints
-  // above them and below the text scrim (1) and the chat itself (3).
+  // overlay goes inside the chat view, just before the chat body. At z-index 1
+  // and after the text scrim in the DOM (also 1), it paints above the wallpaper
+  // and scene layers (0) and the scrim, and below the wallpaper transition fade
+  // (2) and the chat itself (3). Under the scrim, the theme's scrim color washed
+  // the model out, most visibly in light themes.
   const placeOverlay = () => {
     if (!overlayMount) return;
     const host = overlayMount.root;
