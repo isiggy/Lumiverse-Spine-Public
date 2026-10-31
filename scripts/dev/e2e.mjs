@@ -105,7 +105,7 @@ async function stageInfo() {
             }
           }
           resolve({
-            overlay: !!canvas.closest('.spine-avatars-overlay'),
+            overlay: !!canvas.closest('[data-lumiverse-avatar-layer]'),
             width: Math.round(rect.width),
             height: Math.round(rect.height),
             pixelWidth: canvas.width,

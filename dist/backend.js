@@ -2240,7 +2240,8 @@ function defaultSettings() {
   return {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
-    characterModelsSettings: {}
+    characterModelsSettings: {},
+    characterLayers: {}
   };
 }
 function findAnimation(names, hints) {
@@ -2302,6 +2303,12 @@ function normalizeSettings(raw) {
           kept[modelId] = ensureModelSettingsShape(modelSettings);
       }
       base.characterModelsSettings[characterId] = kept;
+    }
+  }
+  if (isPlainObject(value.characterLayers)) {
+    for (const [characterId, layer] of Object.entries(value.characterLayers)) {
+      if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
+        base.characterLayers[characterId] = layer;
     }
   }
   return base;
