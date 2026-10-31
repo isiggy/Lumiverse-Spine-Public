@@ -22,11 +22,26 @@
  * Each model is read and drawn by the Spine runtime for its editor version
  * (runtimes.ts). Models of different versions share the canvas: each runtime
  * gets its own renderer on the same WebGL context.
+ *
+ * Over the app the canvas goes in a layer shared with the Live2D extension,
+ * and the models are stacked in one order with its models (Send to front /
+ * Send to back). When a Live2D model sits between two Spine models in that
+ * order, the Spine models above it are drawn on the WebGL canvas and the ones
+ * below are drawn there first and copied onto a plain canvas under it.
  */
 
 import * as spine from '@esotericsoftware/spine-webgl';
 import type { ModelAssets, ModelBundle } from './assets';
-import { type Columns, SharedColumns, sameColumns } from './columns';
+import {
+  type Columns,
+  type LayerKind,
+  type Stacked,
+  SharedColumns,
+  avatarLayer,
+  releaseAvatarLayers,
+  sameColumns,
+  sameStack,
+} from './columns';
 import { type SpineRuntime, runtimeFor } from './runtimes';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
@@ -70,6 +85,8 @@ const MAX_CANVAS_PIXELS = 4096 * 4096;
 const CONTEXT_RESTORE_WAIT_MS = 3000;
 /** How long a model has been on stage before its first thumbnail is taken (its idle pose has settled). */
 const THUMBNAIL_DELAY_MS = 1500;
+/** This extension's id in the registry shared with the Live2D extension (columns.ts). */
+const EXTENSION_ID = 'spine_avatars';
 
 export interface StageDeps {
   getSettings(): SpineSettings;
@@ -77,8 +94,12 @@ export interface StageDeps {
   /** Returns (creating if needed) the per-character per-model settings object. */
   getModelSettings(characterId: string, modelId: string, description: ModelDescription | null): ModelSettings;
   saveSettingsDebounced(): void;
-  /** Whether the stage draws over the app (rather than in the settings tab), where other avatar extensions draw too. */
-  drawsOverApp(): boolean;
+  /**
+   * Where the stage draws over the app, in a layer shared with other avatar
+   * extensions: in front of the app or as the chat background. Null when it
+   * draws in the settings tab instead.
+   */
+  layer(): LayerKind | null;
   /** The stage changed the model's position or zoom itself (a drag). */
   layoutChanged(): void;
   assets: ModelAssets;
@@ -133,6 +154,18 @@ interface LoadedEntry {
   talkTimer: number | null;
   starterTimer: number | null;
   thumbnailTimer: number | null;
+}
+
+/**
+ * Models next to each other in the stacking order, drawn on one canvas: the
+ * WebGL canvas (`copy` null) or a plain canvas the WebGL canvas is copied onto.
+ */
+interface Layer {
+  canvas: HTMLCanvasElement;
+  copy: CanvasRenderingContext2D | null;
+  entries: LoadedEntry[];
+  /** Place in the stacking order of every model on stage, counted from the bottom. */
+  rank: number;
 }
 
 /** A model's column on the stage, in host CSS pixels. */
@@ -361,6 +394,10 @@ export class Stage {
   private characterIds: string[] = [];
   /** Columns the stage is split into: one per member with a model, here or in the Live2D extension. */
   private columns: Columns = { count: 1, index: new Map() };
+  /** Every model in the chat's columns (this extension's and the Live2D extension's), bottom to top. */
+  private stack: Stacked[] = [];
+  /** The loaded models by canvas, bottom to top; the WebGL canvas holds the top layer. */
+  private layers: Layer[] = [];
   private readonly sharedColumns: SharedColumns;
   private loadToken = 0;
   private frameRequest: number | null = null;
@@ -390,7 +427,17 @@ export class Stage {
 
   constructor(private deps: StageDeps) {
     for (const [target, type, listener, options] of this.listeners) target.addEventListener(type, listener, options);
-    this.sharedColumns = new SharedColumns('spine_avatars', () => this.updateColumns());
+    this.sharedColumns = new SharedColumns(EXTENSION_ID, () => this.updateColumns());
+    this.sharedColumns.setHitTest((canvas, clientX, clientY) => {
+      const layer = this.layers.find((candidate) => candidate.canvas === canvas);
+      if (!layer) return null;
+      const point = this.toStagePoint({ clientX, clientY });
+      for (let i = layer.entries.length - 1; i >= 0; i--) {
+        const entry = layer.entries[i]!;
+        if (this.isOverModel(entry, point.x, point.y)) return entry.characterId;
+      }
+      return null;
+    });
   }
 
   destroy(): void {
@@ -459,24 +506,101 @@ export class Stage {
   }
 
   /**
-   * Share which characters have a model here with the other avatar extension,
-   * and take the columns for the chat's members. The render loop reads them
-   * every frame, so a change shows on the next one.
+   * Share which characters have a model here, and their stacking layers, with
+   * the other avatar extension, and take the columns and stacking order for
+   * the chat's members. The render loop reads them every frame, so a change
+   * shows on the next one.
    */
   private updateColumns(): void {
-    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
-    const overApp = this.host !== null && this.deps.drawsOverApp();
-    this.sharedColumns.publish(overApp ? own : []);
+    const settings = this.deps.getSettings();
+    const own = [...this.boundCharacters(settings).keys()];
+    const overApp = this.host !== null && this.deps.layer() !== null;
+    this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
     const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
-    if (sameColumns(columns, this.columns)) return;
+    const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
+    if (sameColumns(columns, this.columns) && sameStack(stack, this.stack)) return;
     this.columns = columns;
+    this.stack = stack;
     this.sortEntries();
   }
 
-  /** Keep the draw order left to right, whatever order the models finish loading in. */
+  /**
+   * Draw a character's model above (or below) every other model in the chat,
+   * from either extension. False when it isn't on stage with other models, or
+   * is already there.
+   */
+  restack(characterId: string, toFront: boolean): boolean {
+    this.updateColumns();
+    const self = this.stack.find((item) => item.extension === EXTENSION_ID && item.characterId === characterId);
+    if (!self || this.stack.length < 2) return false;
+    if (this.stack[toFront ? this.stack.length - 1 : 0] === self) return false;
+    const others = this.stack.filter((item) => item !== self).map((item) => item.layer);
+    const layer = toFront ? Math.max(...others) + 1 : Math.min(...others) - 1;
+    const settings = this.deps.getSettings();
+    if (layer === 0) delete settings.characterLayers[characterId];
+    else settings.characterLayers[characterId] = layer;
+    this.deps.saveSettingsDebounced();
+    this.updateColumns();
+    return true;
+  }
+
+  /** Where the stage draws moved (in front of the app or behind the chat): move the canvases there. */
+  layerChanged(): void {
+    this.updateColumns();
+    this.sortEntries();
+    releaseAvatarLayers();
+  }
+
+  /**
+   * Keep the models in column order, whatever order they finish loading in,
+   * and split them into layers by the stacking order: a run of models with no
+   * Live2D model between them shares a canvas. The top run draws on the WebGL
+   * canvas; each run under it gets a plain canvas.
+   */
   private sortEntries(): void {
     const column = (entry: LoadedEntry) => this.columns.index.get(entry.characterId) ?? 0;
     this.loaded.sort((a, b) => column(a) - column(b));
+    const gl = this.gl;
+    const host = this.host;
+    if (!gl || !host) return;
+
+    const runs: Array<{ entries: LoadedEntry[]; rank: number }> = [];
+    const placed = new Set<LoadedEntry>();
+    let run: { entries: LoadedEntry[]; rank: number } | null = null;
+    this.stack.forEach((item, rank) => {
+      const entry =
+        item.extension === EXTENSION_ID ? this.loaded.find((candidate) => candidate.characterId === item.characterId) : undefined;
+      if (item.extension !== EXTENSION_ID) run = null;
+      if (!entry) return;
+      if (!run) {
+        run = { entries: [], rank };
+        runs.push(run);
+      }
+      run.entries.push(entry);
+      placed.add(entry);
+    });
+    const unplaced = this.loaded.filter((entry) => !placed.has(entry));
+    if (unplaced.length > 0) runs.push({ entries: unplaced, rank: this.stack.length });
+
+    const spare = this.layers.filter((layer) => layer.copy).map((layer) => layer.canvas);
+    this.layers = runs.map((each, index) => {
+      if (index === runs.length - 1) return { canvas: gl.canvas, copy: null, ...each };
+      let canvas = spare.shift();
+      if (!canvas) {
+        canvas = document.createElement('canvas');
+        canvas.className = 'spine-avatars-canvas';
+        this.sharedColumns.adopt(canvas);
+      }
+      return { canvas, copy: canvas.getContext('2d'), ...each };
+    });
+    for (const canvas of spare) canvas.remove();
+    const kind = this.deps.layer();
+    this.sharedColumns.place(
+      kind ? avatarLayer(kind) : host,
+      this.layers.length > 0
+        ? this.layers.map((layer) => ({ canvas: layer.canvas, rank: layer.rank }))
+        : [{ canvas: gl.canvas, rank: this.stack.length }],
+    );
   }
 
   /** Rebuild the whole stage from current settings + chat context. */
@@ -519,6 +643,7 @@ export class Stage {
   private createGl(host: HTMLElement, runtime: SpineRuntime): Gl {
     const canvas = document.createElement('canvas');
     canvas.className = 'spine-avatars-canvas';
+    this.sharedColumns.adopt(canvas);
     host.appendChild(canvas);
     try {
       const first = createRenderer(runtime, canvas);
@@ -718,7 +843,7 @@ export class Stage {
       this.deps.log(`Thumbnail failed: ${String(error)}`);
       return null;
     } finally {
-      this.draw(
+      this.drawLayers(
         gl,
         this.loaded.map((other) => ({ entry: other, settings: this.settingsFor(other) })),
         width,
@@ -772,8 +897,36 @@ export class Stage {
     const height = this.hostHeight;
     if (width === 0 || height === 0 || gl.context.isContextLost()) return;
     this.resizeCanvas(gl, width, height, renderScale);
-    this.draw(gl, drawn, width, height);
+    this.drawLayers(gl, drawn, width, height);
   };
+
+  /**
+   * Draw each layer's models: the layers under the top one into the WebGL
+   * canvas and copied onto their own canvases, then the top layer, which stays.
+   */
+  private drawLayers(
+    gl: Gl,
+    drawn: Array<{ entry: LoadedEntry; settings: ModelSettings }>,
+    width: number,
+    height: number,
+  ): void {
+    if (this.layers.length <= 1) {
+      this.draw(gl, drawn, width, height);
+      return;
+    }
+    const layerDrawn = (layer: Layer) => drawn.filter(({ entry }) => layer.entries.includes(entry));
+    for (const layer of this.layers) {
+      const copy = layer.copy;
+      if (!copy) continue;
+      this.draw(gl, layerDrawn(layer), width, height);
+      if (layer.canvas.width !== gl.canvas.width) layer.canvas.width = gl.canvas.width;
+      if (layer.canvas.height !== gl.canvas.height) layer.canvas.height = gl.canvas.height;
+      copy.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
+      copy.drawImage(gl.canvas, 0, 0);
+    }
+    const top = this.layers.find((layer) => !layer.copy);
+    this.draw(gl, top ? layerDrawn(top) : [], width, height);
+  }
 
   private resizeCanvas(gl: Gl, width: number, height: number, renderScale: number): void {
     const density = (window.devicePixelRatio || 1) * renderScale;
@@ -1036,23 +1189,12 @@ export class Stage {
    * overlap, the one drawn on top wins.
    */
   private modelAt(event: PointerEvent): LoadedEntry | null {
-    const canvas = this.gl?.canvas;
-    if (this.loaded.length === 0 || !canvas) return null;
+    if (this.loaded.length === 0 || !this.gl) return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR)) return null;
-
-    const previous = canvas.style.pointerEvents;
-    canvas.style.pointerEvents = 'auto';
-    const topmost = document.elementFromPoint(event.clientX, event.clientY);
-    canvas.style.pointerEvents = previous;
-    if (topmost !== canvas) return null;
-
-    const point = this.toStagePoint(event);
-    for (let i = this.loaded.length - 1; i >= 0; i--) {
-      const entry = this.loaded[i]!;
-      if (this.isOverModel(entry, point.x, point.y)) return entry;
-    }
-    return null;
+    // Over the app, a Live2D model may be drawn over ours: the topmost model wins.
+    const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
+    return hit?.extension === EXTENSION_ID ? (this.entryFor(hit.characterId) ?? null) : null;
   }
 
   private isOverModel(entry: LoadedEntry, stageX: number, stageY: number): boolean {
@@ -1185,7 +1327,7 @@ export class Stage {
     document.documentElement.classList.toggle('spine-avatars-hover', hovering);
   }
 
-  private toStagePoint(event: PointerEvent): { x: number; y: number } {
+  private toStagePoint(event: { clientX: number; clientY: number }): { x: number; y: number } {
     const rect = this.gl?.canvas.getBoundingClientRect();
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
@@ -1258,5 +1400,8 @@ export class Stage {
       }
       gl.canvas.remove();
     }
+    for (const layer of this.layers) layer.canvas.remove();
+    this.layers = [];
+    releaseAvatarLayers();
   }
 }

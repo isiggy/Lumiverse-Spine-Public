@@ -151,6 +151,12 @@ export interface SpineSettings {
   characterModelMapping: Record<string, string>;
   /** characterId -> modelId -> per-model settings */
   characterModelsSettings: Record<string, Record<string, ModelSettings>>;
+  /**
+   * characterId -> stacking layer where models overlap in a group chat (Send
+   * to front / Send to back); higher draws on top. Characters left out are on
+   * layer 0.
+   */
+  characterLayers: Record<string, number>;
 }
 
 export interface ModelRecord {
@@ -205,6 +211,7 @@ export function defaultSettings(): SpineSettings {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
     characterModelsSettings: {},
+    characterLayers: {},
   };
 }
 
@@ -269,6 +276,11 @@ export function normalizeSettings(raw: unknown): SpineSettings {
         if (isPlainObject(modelSettings)) kept[modelId] = ensureModelSettingsShape(modelSettings as unknown as ModelSettings);
       }
       base.characterModelsSettings[characterId] = kept;
+    }
+  }
+  if (isPlainObject(value.characterLayers)) {
+    for (const [characterId, layer] of Object.entries(value.characterLayers)) {
+      if (typeof layer === 'number' && Number.isFinite(layer) && layer !== 0) base.characterLayers[characterId] = layer;
     }
   }
   return base;

@@ -556,7 +556,8 @@ export class SettingsUI {
           note(
             'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
               'member with a model (Spine or, with the Live2D Avatars extension, Live2D), in member order; ' +
-              'zoom, X and Y offset and Fit to canvas work within that column.',
+              'zoom, X and Y offset and Fit to canvas work within that column. Where models overlap, Send to ' +
+              'front and Send to back in Model settings choose which one is drawn on top.',
           ),
         );
       }
@@ -867,6 +868,19 @@ export class SettingsUI {
         viewStatus.root,
       ),
     );
+    if (stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
+      // Where models overlap in a group chat, Spine or Live2D.
+      const stackStatus = statusLine();
+      const restack = (toFront: boolean) =>
+        onStage(stackStatus, () => {
+          if (!stage.restack(characterId, toFront)) stackStatus.say(toFront ? 'Already in front.' : 'Already at the back.');
+        });
+      const front = button('Send to front', () => restack(true));
+      front.title = 'Draw this model over the other models in the chat where they overlap';
+      const back = button('Send to back', () => restack(false));
+      back.title = 'Draw this model under the other models in the chat where they overlap';
+      view.appendChild(row(front, back, stackStatus.root));
+    }
     view.append(renderScale.root, zoom.root, rotation.root, speed.root, offsetX.root, offsetY.root);
     view.appendChild(
       checkbox('Premultiplied alpha', modelSettings.premultipliedAlpha, (value) => {

@@ -7,6 +7,7 @@
 
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { ModelAssets } from './frontend/assets';
+import { placeAvatarLayers } from './frontend/columns';
 import { Stage } from './frontend/stage';
 import { SettingsUI, UI_CSS, type UIController } from './frontend/ui';
 import { tusUpload } from './frontend/tus';
@@ -30,12 +31,6 @@ const STAGE_CSS = `
 .spine-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .spine-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
-/* Background mode: the host mounts the overlay at z-index 9990 above the whole
-   app. Drop it to 0 so it sits above the app's backdrop and global wallpaper
-   but under <main> (z-index 1), which holds the chat. While a chat is open the
-   overlay moves into the chat view instead (see placeOverlay). */
-html.spine-avatars-bg .spine-avatars-mount { z-index: 0 !important; }
-html.spine-avatars-bg .spine-avatars-overlay { z-index: 1; }
 `;
 
 // A jointed figure: bones and joints, the way a Spine rig is built.
@@ -107,7 +102,7 @@ export function setup(ctx: SpindleFrontendContext) {
     getModelRecord: (modelId) => models.find((model) => model.id === modelId),
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
-    drawsOverApp: () => overlayActive,
+    layer: () => (overlayActive ? (backgroundModeOn() ? 'background' : 'front') : null),
     layoutChanged: () => ui.layoutChanged(),
     assets,
     sendInteraction: (message, characterId) => {
@@ -169,35 +164,15 @@ export function setup(ctx: SpindleFrontendContext) {
     applyBackgroundMode();
   };
 
-  const applyBackgroundMode = () => {
-    const on = settings.global.enabled && settings.global.backgroundMode && overlayActive;
-    document.documentElement.classList.toggle('spine-avatars-bg', on);
-    setOverlayTracking(on);
-    placeOverlay();
-  };
-  cleanups.push(() => document.documentElement.classList.remove('spine-avatars-bg'));
+  const backgroundModeOn = () => settings.global.enabled && settings.global.backgroundMode && overlayActive;
 
-  // In background mode the chat view draws its own wallpaper and scene image
-  // inside <main>, faded by the user's wallpaper opacity. Under <main> the model
-  // would show through that fade, so a fully opaque wallpaper hid it. Instead the
-  // overlay goes inside the chat view, just before the chat body. At z-index 1
-  // and after the text scrim in the DOM (also 1), it paints above the wallpaper
-  // and scene layers (0) and the scrim, and below the wallpaper transition fade
-  // (2) and the chat itself (3). Under the scrim, the theme's scrim color washed
-  // the model out, most visibly in light themes.
-  const placeOverlay = () => {
-    if (!overlayMount) return;
-    const host = overlayMount.root;
-    const bgOn = document.documentElement.classList.contains('spine-avatars-bg');
-    // Fast path for the observer, which fires on every chat update: still in place.
-    const next = host.nextElementSibling;
-    if (bgOn && host.isConnected && next?.getAttribute('data-lumiverse-surface') === 'chat-body') return;
-    const chatBody = bgOn
-      ? document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]')
-      : null;
-    const target = chatBody?.parentElement ?? overlayMount.mountRoot;
-    if (host.parentElement === target && (!chatBody || host.nextElementSibling === chatBody)) return;
-    target.insertBefore(host, chatBody ?? null);
+  // The overlay host only sizes the stage: the models' canvases go in a layer
+  // shared with the Live2D extension (columns.ts), in front of the app or, in
+  // background mode, in the chat view between its wallpaper and the messages.
+  const applyBackgroundMode = () => {
+    setOverlayTracking(backgroundModeOn());
+    placeAvatarLayers();
+    stage.layerChanged();
   };
 
   // Opening another chat or page replaces the chat view, so follow it.
@@ -209,7 +184,7 @@ export function setup(ctx: SpindleFrontendContext) {
         if (placeFrame !== null) return;
         placeFrame = window.requestAnimationFrame(() => {
           placeFrame = null;
-          placeOverlay();
+          placeAvatarLayers();
         });
       });
       overlayObserver.observe(document.querySelector('[data-app-root]') ?? document.body, {
