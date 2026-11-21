@@ -3,8 +3,8 @@
  * Keep this file the same in the Live2D Avatars and Spine Avatars repos.
  *
  * In a group chat the stage is split into equal columns, one per member with a
- * model, in member order unless the user rearranged them by dragging a model
- * into another column (see ColumnOrder). A member's model can be a Live2D model or a Spine
+ * model, in member order. A column is where its model starts out (X offset 0);
+ * a drag can take the model anywhere on the stage (see stageX). A member's model can be a Live2D model or a Spine
  * model, and each extension draws on its own canvases, so both have to count
  * the columns the same way. Each extension publishes which characters it has a
  * model for on a registry on `window` (extension frontends run in the same
@@ -47,42 +47,6 @@ interface Registry {
   layers?: Record<string, Record<string, number>>;
   /** extension id -> its hit test. Added after version 1 shipped, so it can be missing. */
   hitTests?: Record<string, HitTest>;
-  /** The newest column order either extension has. Added after version 1 shipped, so it can be missing. */
-  order?: ColumnOrder;
-}
-
-/**
- * The left-to-right order the user arranged characters in, by dragging a
- * model into another column. One list for every chat: members of a chat
- * that are in it take their columns in its order, ahead of members that
- * aren't (who keep member order). Both extensions save a copy in their
- * settings and share it here; the newer one (`at`, a Date.now()) wins.
- */
-export interface ColumnOrder {
-  characterIds: string[];
-  at: number;
-}
-
-/** Most characters a column order remembers. */
-const MAX_ORDER = 1000;
-
-/**
- * The column order after the user arranged some characters (a chat's columns)
- * in this order: they take the place of the first of them, in this order, and
- * every other character keeps its place.
- */
-export function arrangeColumns(order: ColumnOrder, arrangement: string[]): ColumnOrder {
-  const moved = new Set(arrangement);
-  const first = order.characterIds.findIndex((id) => moved.has(id));
-  const rest = order.characterIds.filter((id) => !moved.has(id));
-  rest.splice(first === -1 ? rest.length : first, 0, ...moved);
-  // Forget the characters furthest from this arrangement first.
-  while (rest.length > MAX_ORDER) {
-    const index = rest.findLastIndex((id) => !moved.has(id));
-    if (index === -1) break;
-    rest.splice(index, 1);
-  }
-  return { characterIds: rest, at: Math.max(Date.now(), order.at + 1) };
 }
 
 export interface Columns {
@@ -114,6 +78,23 @@ function registry(): Registry {
   const fresh: Registry = { version: 1, extensions: {} };
   scope[REGISTRY_KEY] = fresh;
   return fresh;
+}
+
+/**
+ * Where a model's center goes across the stage for its X offset: at 0 the
+ * center of its column, at -100 / 100 the stage's left / right edge, in
+ * proportion between. So in a group chat a model can be placed anywhere on
+ * the stage, and in a solo chat (one column) it's a percent of half the stage.
+ */
+export function stageX(stageWidth: number, columnCenter: number, offset: number): number {
+  return columnCenter + (offset / 100) * (offset < 0 ? columnCenter : stageWidth - columnCenter);
+}
+
+/** The X offset (-100..100) that puts a model's center at this stage x; the inverse of stageX. */
+export function offsetForStageX(stageWidth: number, columnCenter: number, x: number): number {
+  const delta = x - columnCenter;
+  const room = delta < 0 ? columnCenter : stageWidth - columnCenter;
+  return room > 0 ? Math.min(100, Math.max(-100, (delta / room) * 100)) : 0;
 }
 
 export function sameColumns(a: Columns, b: Columns): boolean {
@@ -177,25 +158,11 @@ export class SharedColumns {
   }
 
   /**
-   * Share this extension's column order with the other extension, and get the
-   * newest one either has (when it's the other's, save it as this
-   * extension's own too).
+   * The columns for a chat's members, in member order: one per member with a
+   * model in this extension (`own`) or, when `shared`, in any other extension
+   * drawing over the app.
    */
-  shareOrder(order: ColumnOrder): ColumnOrder {
-    const shared = registry();
-    if (shared.order && shared.order.at >= order.at) return shared.order;
-    shared.order = { characterIds: [...order.characterIds], at: order.at };
-    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
-    return shared.order;
-  }
-
-  /**
-   * The columns for a chat's members: one per member with a model in this
-   * extension (`own`) or, when `shared`, in any other extension drawing over
-   * the app. Members in `order` come first, in that order; the rest follow in
-   * member order.
-   */
-  layout(members: string[], own: Iterable<string>, shared: boolean, order: string[] = []): Columns {
+  layout(members: string[], own: Iterable<string>, shared: boolean): Columns {
     const withModel = new Set(own);
     if (shared) {
       for (const [extension, characterIds] of Object.entries(registry().extensions)) {
@@ -203,11 +170,8 @@ export class SharedColumns {
         for (const characterId of characterIds) withModel.add(characterId);
       }
     }
-    const position = new Map(order.map((characterId, index) => [characterId, index]));
-    const placed = members.filter((characterId) => position.has(characterId));
-    placed.sort((a, b) => position.get(a)! - position.get(b)!);
     const index = new Map<string, number>();
-    for (const characterId of [...placed, ...members.filter((characterId) => !position.has(characterId))]) {
+    for (const characterId of members) {
       if (withModel.has(characterId) && !index.has(characterId)) index.set(characterId, index.size);
     }
     return { count: Math.max(1, index.size), index };
@@ -340,24 +304,19 @@ export interface MenuItem {
 }
 
 /** What a model menu entry does. */
-export type MenuAction = 'front' | 'back' | 'left' | 'right';
+export type MenuAction = 'front' | 'back';
 
 /**
  * The menu a right-click or long press on a model shows when it shares the
- * stage with other models (a group chat): Send to front / Send to back, and
- * Move left / Move right to swap columns with a neighbor. Null when the model
- * is alone on the stage. The same in both extensions.
+ * stage with other models (a group chat): Send to front / Send to back. Null
+ * when the model is alone on the stage. The same in both extensions.
  */
 export function modelMenu(stack: Stacked[], columns: Columns, extension: string, characterId: string): MenuItem[] | null {
   const rank = stack.findIndex((item) => item.extension === extension && item.characterId === characterId);
-  const column = columns.index.get(characterId);
-  if (rank === -1 || column === undefined || stack.length < 2) return null;
-  const items: Array<MenuItem & { key: MenuAction | 'divider' }> = [
+  if (rank === -1 || !columns.index.has(characterId) || stack.length < 2) return null;
+  const items: Array<MenuItem & { key: MenuAction }> = [
     { key: 'front', label: 'Send to front', disabled: rank === stack.length - 1 },
     { key: 'back', label: 'Send to back', disabled: rank === 0 },
-    { key: 'divider', label: '', type: 'divider' },
-    { key: 'left', label: 'Move left', disabled: column === 0 },
-    { key: 'right', label: 'Move right', disabled: column >= columns.count - 1 },
   ];
   return items;
 }
