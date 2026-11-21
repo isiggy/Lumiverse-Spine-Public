@@ -570,13 +570,18 @@ function sampleClassifyText(text: string): string {
  * Emotions are auto-mapped to animations here, so no fallback label is
  * returned: a guess would play an animation on every message.
  */
-async function classifyExpression(text: string): Promise<{ label: string } | { error: string }> {
+async function classifyExpression(
+  text: string,
+  userId?: string,
+): Promise<{ label: string } | { error: string }> {
   if (!text.trim()) return { error: 'Nothing to classify.' };
   if (!spindle.permissions.has('generation')) return { error: 'Needs the "generation" permission.' };
   const labels = CLASSIFY_EXPRESSIONS.join(', ');
   try {
     const result = (await spindle.generate.quiet({
       type: 'quiet',
+      // Operator-scoped installs have no owner to fall back on, so name the user.
+      ...(userId ? { userId } : {}),
       messages: [
         {
           role: 'system',
@@ -667,7 +672,7 @@ async function handleCharacterMessage(
   if (settings.global.expressionSource !== 'llm') return;
   if (!text) return;
 
-  const result = await classifyExpression(text);
+  const result = await classifyExpression(text, userId);
   if (!('label' in result)) return;
   send({ type: 'expression', chatId, characterId, label: result.label, source: 'llm' }, userId);
 }
@@ -753,7 +758,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         await sendChatContext(msg.chatId, userId);
         break;
       case 'classify_test': {
-        const result = await classifyExpression(msg.text);
+        const result = await classifyExpression(msg.text, userId);
         send(
           'label' in result
             ? { type: 'classify_test_result', label: result.label }
