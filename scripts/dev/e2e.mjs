@@ -16,6 +16,9 @@
 //                                 # removing a member re-lays the stage out
 //   lumiverse.sh e2e --library    # also test the model library (thumbnails, sorting, filter, tiles
 //                                 # and list), dropdown search, and settings file export/import
+//   lumiverse.sh e2e --background # also, with the model as the chat background: a tap through the
+//                                 # empty chat plays On click, while a drag, a long press, a message
+//                                 # and the input don't
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -30,6 +33,7 @@ const keepOpen = process.argv.includes('--keep-open');
 const controls = process.argv.includes('--controls');
 const group = process.argv.includes('--group');
 const testLibrary = process.argv.includes('--library');
+const testBackground = process.argv.includes('--background');
 const MODEL_ZIPS = (process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP).split('\n').filter(Boolean);
 const GROUP_CHAT = `${BASE}/chat/${process.env.LUMI_GROUP_CHAT_ID}`;
 const GROUP_MEMBERS = (process.env.LUMI_GROUP_MEMBERS || '').split('\n').filter(Boolean);
@@ -902,6 +906,91 @@ async function runGroup() {
   await page.screenshot({ path: `${OUT}/group-member-added.png` });
 }
 
+/** Press (optionally hold and move) and release at a viewport point; returns whether the stage counted a tap. */
+async function pressAt(x, y, { holdMs = 0, moveBy = 0 } = {}) {
+  const count = () => page.evaluate(() => Number(document.querySelector('.spine-avatars-canvas')?.dataset.spineTaps ?? 0));
+  const before = await count();
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  if (holdMs) await page.waitForTimeout(holdMs);
+  if (moveBy) await page.mouse.move(x + moveBy, y + moveBy, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  return (await count()) > before;
+}
+
+/**
+ * With the model as the chat background, the chat is above it: a tap must
+ * reach the model where the chat draws nothing, and only there, without
+ * taking the chat's presses (scrolling, selecting, its buttons and input).
+ */
+async function runBackgroundTaps() {
+  console.log('Taps through the chat (background mode):');
+  await openSpineTab();
+  const onClick = page.locator('.spn-root select[aria-label="On click"]').first();
+  const previousClick = await onClick.inputValue();
+  if (previousClick === 'none') await onClick.selectOption({ index: 1 });
+  await setCheckbox('Show model as chat background', true);
+  await page.waitForTimeout(1000);
+  await page.goto(CHAT);
+  await page.waitForSelector('[data-lumiverse-avatar-layer="background"] .spine-avatars-canvas', { timeout: 180000 });
+  await page.waitForTimeout(4000);
+  check(true, 'the model is drawn as the chat background');
+
+  // A point on the model with only the empty chat above it.
+  const spot = await page.evaluate(() => {
+    const canvas = document.querySelector('.spine-avatars-canvas');
+    const hitTest = window.__lumiverseAvatarColumns?.hitTests?.spine_avatars;
+    const rect = canvas.getBoundingClientRect();
+    for (let y = rect.top + rect.height * 0.3; y < rect.bottom * 0.8; y += 20) {
+      for (let x = rect.left + rect.width * 0.3; x < rect.right * 0.7; x += 20) {
+        const top = document.elementFromPoint(x, y);
+        if (!top?.closest('[data-lumiverse-surface="chat-body"]')) continue;
+        if (top.closest('[data-component="MinimalMessage"], [data-component="BubbleMessage"], [data-component="InputArea"]')) continue;
+        if (hitTest?.(canvas, x, y)) return { x, y };
+      }
+    }
+    return null;
+  });
+  if (!spot) {
+    check(false, 'found a point on the model under the empty chat');
+  } else {
+    check(await pressAt(spot.x, spot.y), 'a tap on the model through the empty chat plays On click');
+    await page.screenshot({ path: `${OUT}/bg-tap-through-chat.png` });
+    check(!(await pressAt(spot.x, spot.y, { moveBy: 30 })), 'a drag through the chat is not a tap');
+    check(!(await pressAt(spot.x, spot.y, { holdMs: 800 })), 'a long press through the chat is not a tap');
+  }
+
+  // A message over the model keeps the tap.
+  const onMessage = await page.evaluate(() => {
+    const canvas = document.querySelector('.spine-avatars-canvas');
+    const hitTest = window.__lumiverseAvatarColumns?.hitTests?.spine_avatars;
+    for (const card of document.querySelectorAll('[data-component="MinimalMessage"], [data-component="BubbleMessage"]')) {
+      const rect = card.getBoundingClientRect();
+      for (let x = rect.left + 20; x < rect.right - 20; x += 20) {
+        const y = rect.top + rect.height / 2;
+        if (hitTest?.(canvas, x, y) && document.elementFromPoint(x, y)?.closest('[data-component]') ) return { x, y };
+      }
+    }
+    return null;
+  });
+  if (onMessage) check(!(await pressAt(onMessage.x, onMessage.y)), 'a tap on a message over the model stays the message’s');
+  else console.log('skip a tap on a message: no message over the model');
+
+  const input = page.locator('[data-component="InputArea"] textarea').first();
+  const inputBox = await input.boundingBox();
+  if (inputBox) {
+    const tapped = await pressAt(inputBox.x + inputBox.width / 2, inputBox.y + inputBox.height / 2);
+    const focused = await input.evaluate((node) => document.activeElement === node);
+    check(!tapped && focused, 'a click on the message input focuses it and is no tap');
+  }
+
+  await openSpineTab();
+  await setCheckbox('Show model as chat background', false);
+  if (previousClick === 'none') await page.locator('.spn-root select[aria-label="On click"]').first().selectOption('none');
+  await page.waitForTimeout(1000);
+}
+
 try {
   await page.goto(BASE);
   await page.fill('input[type="text"]', process.env.LUMI_USER);
@@ -973,6 +1062,7 @@ try {
 
   if (controls && failures.length === 0) await runControls();
   if (testLibrary && stage?.drawnFraction > 0) await runLibrary();
+  if (testBackground && stage?.drawnFraction > 0) await runBackgroundTaps();
 
   console.log(`Screenshots: ${OUT}`);
   for (const problem of problems) console.log(problem);

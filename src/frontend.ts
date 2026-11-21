@@ -31,6 +31,7 @@ const STAGE_CSS = `
 .spine-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .spine-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
+html.spine-avatars-tap, html.spine-avatars-tap * { cursor: pointer !important; }
 `;
 
 // A jointed figure: bones and joints, the way a Spine rig is built.

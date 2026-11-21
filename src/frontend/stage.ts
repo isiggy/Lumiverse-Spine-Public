@@ -53,6 +53,11 @@ import {
   SETTINGS_LIMITS,
 } from '../shared/settings';
 
+/** A press through the chat on a background model is a tap if released this soon… */
+const TAP_MAX_MS = 500;
+/** …and this close to where it started (CSS px). */
+const TAP_SLOP_PX = 8;
+
 /** Host UI under the pointer that must keep its clicks even where the model is drawn. */
 const INTERACTIVE_SELECTOR = [
   'input',
@@ -410,8 +415,14 @@ export class Stage {
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
     null;
   private suppressClick = false;
+  /**
+   * A press on a background model through the chat (see SharedColumns.topmostAt):
+   * left to the chat, so it can still scroll or select text, and taken for a
+   * tap on the model if it's released soon, nearby, without selecting anything.
+   */
+  private pendingTap: { entry: LoadedEntry; pointerId: number; x: number; y: number; at: number } | null = null;
   private hoverFrame: number | null = null;
-  private hovering = false;
+  private hovering: false | 'grab' | 'tap' = false;
 
   // The canvas never takes pointer events, so it can't block the chat UI drawn
   // under it. Model interaction is detected at the document level instead.
@@ -420,6 +431,7 @@ export class Stage {
     [document, 'pointermove', (event) => this.onPointerMove(event as PointerEvent), { capture: true }],
     [document, 'pointerup', (event) => this.onPointerUp(event as PointerEvent), { capture: true }],
     [document, 'pointercancel', () => this.endDrag(), { capture: true }],
+    [document, 'scroll', () => (this.pendingTap = null), { capture: true, passive: true }],
     [document, 'click', (event) => this.onClickCapture(event as MouseEvent), { capture: true }],
     [document, 'touchstart', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
     [document, 'touchmove', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
@@ -1186,15 +1198,23 @@ export class Stage {
    * canvas must be the topmost layer there (no drawer or modal above it), the
    * element underneath must not be a control (input, button, link…), and the
    * point must fall on one of a model's visible drawn parts. Where models
-   * overlap, the one drawn on top wins.
+   * overlap, the one drawn on top wins. `through`: a background model under
+   * an empty part of the chat, which can be tapped but not dragged.
    */
-  private modelAt(event: PointerEvent): LoadedEntry | null {
+  private modelAt(event: PointerEvent): { entry: LoadedEntry; through: boolean } | null {
     if (this.loaded.length === 0 || !this.gl) return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR)) return null;
     // Over the app, a Live2D model may be drawn over ours: the topmost model wins.
     const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
-    return hit?.extension === EXTENSION_ID ? (this.entryFor(hit.characterId) ?? null) : null;
+    const entry = hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) : undefined;
+    return entry ? { entry, through: hit!.through } : null;
+  }
+
+  /** Whether a click on a model plays or sends anything. */
+  private clickDoesSomething(entry: LoadedEntry): boolean {
+    const click = this.settingsFor(entry).animation_click;
+    return click.animation !== 'none' || click.message !== '';
   }
 
   private isOverModel(entry: LoadedEntry, stageX: number, stageY: number): boolean {
@@ -1243,8 +1263,14 @@ export class Stage {
 
   private onPointerDown(event: PointerEvent): void {
     if (event.button !== 0) return;
-    const entry = this.modelAt(event);
-    if (!entry) return;
+    const hit = this.modelAt(event);
+    if (!hit) return;
+    const { entry } = hit;
+    if (hit.through) {
+      // Through the chat (a background model): only a tap, and the chat keeps the press.
+      this.pendingTap = { entry, pointerId: event.pointerId, x: event.clientX, y: event.clientY, at: performance.now() };
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -1267,11 +1293,23 @@ export class Stage {
       this.dragTo(drag, event);
       return;
     }
+    const pending = this.pendingTap;
+    if (
+      pending &&
+      event.pointerId === pending.pointerId &&
+      Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > TAP_SLOP_PX
+    ) {
+      this.pendingTap = null;
+    }
     if (this.loaded.length === 0) return;
     if (event.pointerType === 'mouse' && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.modelAt(event) !== null);
+        const hit = this.modelAt(event);
+        if (!hit) this.setHovering(false);
+        else if (!hit.through) this.setHovering('grab');
+        // Through the chat a model can only be tapped: say so where a tap plays something.
+        else this.setHovering(this.clickDoesSomething(hit.entry) ? 'tap' : false);
       });
     }
   }
@@ -1297,6 +1335,20 @@ export class Stage {
   }
 
   private onPointerUp(event: PointerEvent): void {
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId) {
+      this.pendingTap = null;
+      const selection = window.getSelection();
+      if (
+        this.loaded.includes(pending.entry) &&
+        performance.now() - pending.at <= TAP_MAX_MS &&
+        Math.hypot(event.clientX - pending.x, event.clientY - pending.y) <= TAP_SLOP_PX &&
+        (!selection || selection.isCollapsed)
+      ) {
+        this.onModelClick(pending.entry);
+      }
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId) return;
     event.preventDefault();
@@ -1307,6 +1359,7 @@ export class Stage {
 
   private endDrag(): void {
     this.drag = null;
+    this.pendingTap = null;
     // The browser dispatches `click` right after `pointerup`; if the pointer was
     // released over a different element no click comes, so stop suppressing.
     window.setTimeout(() => {
@@ -1321,10 +1374,11 @@ export class Stage {
     event.stopPropagation();
   }
 
-  private setHovering(hovering: boolean): void {
+  private setHovering(hovering: false | 'grab' | 'tap'): void {
     if (hovering === this.hovering) return;
     this.hovering = hovering;
-    document.documentElement.classList.toggle('spine-avatars-hover', hovering);
+    document.documentElement.classList.toggle('spine-avatars-hover', hovering === 'grab');
+    document.documentElement.classList.toggle('spine-avatars-tap', hovering === 'tap');
   }
 
   private toStagePoint(event: { clientX: number; clientY: number }): { x: number; y: number } {
@@ -1334,6 +1388,12 @@ export class Stage {
 
   private onModelClick(entry: LoadedEntry): void {
     const click = this.settingsFor(entry).animation_click;
+    // For tests and debugging: which character was last tapped, and how many taps.
+    const canvas = this.gl?.canvas;
+    if (canvas instanceof HTMLCanvasElement) {
+      canvas.dataset.spineTap = entry.characterId;
+      canvas.dataset.spineTaps = String(Number(canvas.dataset.spineTaps ?? 0) + 1);
+    }
     if (click.message) {
       if (
         this.previousInteraction.characterId === entry.characterId &&
@@ -1356,6 +1416,7 @@ export class Stage {
     // so don't leave the next click anywhere swallowed.
     if (this.drag) this.suppressClick = false;
     this.drag = null;
+    this.pendingTap = null;
     this.setHovering(false);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
