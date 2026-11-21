@@ -2233,7 +2233,9 @@ function defaultGlobalSettings() {
     showBounds: false,
     expressionSource: "llm",
     librarySort: "name",
-    libraryView: "tiles"
+    libraryView: "tiles",
+    showHelp: true,
+    showReloadButton: true
   };
 }
 function defaultSettings() {

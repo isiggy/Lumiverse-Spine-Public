@@ -23678,7 +23678,9 @@ function defaultGlobalSettings() {
     showBounds: false,
     expressionSource: "llm",
     librarySort: "name",
-    libraryView: "tiles"
+    libraryView: "tiles",
+    showHelp: true,
+    showReloadButton: true
   };
 }
 function defaultSettings() {
@@ -25317,6 +25319,9 @@ function field(label, ...controls) {
 function note(text) {
   return el("p", "spn-note", text);
 }
+function help(text) {
+  return el("p", "spn-note spn-help", text);
+}
 var SORT_OPTIONS = [
   { value: "name", label: "Name (A–Z)" },
   { value: "name_desc", label: "Name (Z–A)" },
@@ -25423,6 +25428,8 @@ class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add("spn-root");
+    root.classList.toggle("spn-hide-help", !this.controller.getSettings().global.showHelp);
+    this.controller.syncChatBarButton();
     this.syncLayout = null;
     const generation = ++this.renderGeneration;
     const controller = this.controller;
@@ -25446,6 +25453,7 @@ class SettingsUI {
         globals.enabled = value;
         controller.saveNow();
         controller.reloadStage();
+        controller.syncChatBarButton();
       }),
       checkbox("Show model as chat background", globals.backgroundMode, (value) => {
         globals.backgroundMode = value;
@@ -25464,8 +25472,25 @@ class SettingsUI {
         globals.expressionSource = value;
         controller.saveNow();
       })),
-      note("Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings)."),
-      controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below.")
+      help("Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings)."),
+      controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below."),
+      checkbox("Show help text", globals.showHelp, (value) => {
+        globals.showHelp = value;
+        controller.saveDebounced();
+        root.classList.toggle("spn-hide-help", !value);
+      }, "The explanations under the settings, like this one.")
+    ]));
+    root.appendChild(section("Debug", [
+      checkbox("Show bones and bounds", globals.showBounds, (value) => {
+        globals.showBounds = value;
+        controller.saveDebounced();
+      }),
+      checkbox("Reload button in the chat menu bar", globals.showReloadButton, (value) => {
+        globals.showReloadButton = value;
+        controller.saveDebounced();
+        controller.syncChatBarButton();
+      }, "Adds a button that reloads the Spine models next to the chat’s other icons, above the message input."),
+      row(button("Reload Spine", () => controller.reloadStage()))
     ]));
     if (!controller.usingOverlay()) {
       controller.embeddedHost.classList.add("spn-embedded-host");
@@ -25539,7 +25564,7 @@ class SettingsUI {
         bindingSection.appendChild(note("Your library is empty: import a model in Model library below first."));
       }
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown, side by side in equal columns " + "(Spine and, with the Live2D Avatars extension, Live2D models). " + "Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Right-click a model (or touch and hold it) " + "to send it to the front or back where models overlap, or to move it left or right."));
+        bindingSection.appendChild(help("Group chat: every member with a model is shown, side by side in equal columns " + "(Spine and, with the Live2D Avatars extension, Live2D models). " + "Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Right-click a model (or touch and hold it) " + "to send it to the front or back where models overlap, or to move it left or right."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "spn-dim", this.fileStatusText);
@@ -25675,7 +25700,7 @@ class SettingsUI {
     library.appendChild(libraryList);
     this.renderLibraryList(libraryList);
     if (models.length > 0) {
-      library.appendChild(note(`Spine ${SUPPORTED_SPINE_VERSIONS.join(" and ")} exports are supported. A model’s thumbnail is taken ` + "the first time it’s shown; the highlighted one is the selected character’s."));
+      library.appendChild(help(`Spine ${SUPPORTED_SPINE_VERSIONS.join(" and ")} exports are supported. A model’s thumbnail is taken ` + "the first time it’s shown; the highlighted one is the selected character’s."));
     }
     root.appendChild(section("Model library", [library]));
     const testInput = el("input", "spn-input");
@@ -25704,13 +25729,6 @@ class SettingsUI {
         classifyButton.click();
     });
     root.appendChild(section("Test emotion classification", [row(testInput, classifyButton), testResult], { open: false }));
-    root.appendChild(section("Debug", [
-      checkbox("Show bones and bounds", globals.showBounds, (value) => {
-        globals.showBounds = value;
-        controller.saveDebounced();
-      }),
-      row(button("Reload Spine", () => controller.reloadStage()))
-    ], { open: false }));
     for (const mount of this.pendingMounts.splice(0))
       mount();
   }
@@ -25898,7 +25916,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       modelSettings.premultipliedAlpha = value;
       changed();
     }, `This model’s atlas says ${description.pma ? "on" : "off"}. If edges look dark or haloed, flip it.`));
-    view.appendChild(note("Drag the model on the stage to move it. Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model’s size."));
+    view.appendChild(help("Drag the model on the stage to move it. Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model’s size."));
     host.appendChild(section("View", [view]));
     const options = animationOptions(description);
     const animationStatus = statusLine();
@@ -25949,7 +25967,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       modelSettings.talk_time_per_character = value;
       changed();
     }));
-    animations.appendChild(note("Chat-open, click and emotion animations play once, then the idle loop resumes. " + "The talking animation plays on a layer above them. The click message, if any, is posted to the chat."));
+    animations.appendChild(help("Chat-open, click and emotion animations play once, then the idle loop resumes. " + "The talking animation plays on a layer above them. The click message, if any, is posted to the chat."));
     host.appendChild(section("Animations", [animations]));
     const classify = el("div");
     classify.appendChild(emotionStatus.root);
@@ -25978,7 +25996,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       grid.appendChild(line);
     }
     classify.appendChild(grid);
-    classify.appendChild(note("A new character message plays the animation mapped to its emotion. Dimmed rows play nothing. " + "Emotions whose names match one of the model’s animations are mapped on first load."));
+    classify.appendChild(help("A new character message plays the animation mapped to its emotion. Dimmed rows play nothing. " + "Emotions whose names match one of the model’s animations are mapped on first load."));
     host.appendChild(section("Emotion mappings", [classify], { open: false }));
   }
 }
@@ -26011,6 +26029,7 @@ var UI_CSS = `
 .spn-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
 .spn-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .spn-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.spn-hide-help .spn-help, .spn-hide-help .spn-hint { display: none; }
 .spn-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
 .spn-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
 .spn-slider { margin: 6px 0 2px; }
@@ -26196,8 +26215,12 @@ var STAGE_CSS = `
 .spine-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
 html.spine-avatars-tap, html.spine-avatars-tap * { cursor: pointer !important; }
+.spine-avatars-bar-button { display: flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 26px; padding: 0; border: none; border-radius: var(--lcs-radius-xs, 6px); background: transparent; color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4)); cursor: pointer; transition: color 120ms ease, background 120ms ease; }
+.spine-avatars-bar-button:hover { color: var(--lumiverse-text, rgba(230, 230, 240, 0.92)); background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06)); }
+.spine-avatars-bar-button svg { width: 16px; height: 16px; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2"/><path d="M12 6.5v6.5"/><path d="M12 8.5l-4 2.5-1.5 3.5M12 8.5l4 2.5 1.5 3.5"/><path d="M12 13l-3 3.5L8 21M12 13l3 3.5 1 4.5"/><circle cx="12" cy="13" r=".8"/><circle cx="8" cy="11" r=".8"/><circle cx="16" cy="11" r=".8"/><circle cx="9" cy="16.5" r=".8"/><circle cx="15" cy="16.5" r=".8"/></svg>';
+var RELOAD_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M18.6 2.5v4h-4"/><circle cx="12" cy="9" r="1.3"/><path d="M12 10.4v3.4M12 11.6l-2.6 1.6M12 11.6l2.6 1.6M12 13.8l-1.8 3M12 13.8l1.8 3"/></svg>';
 function downloadJson(fileName, value) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
   const link = document.createElement("a");
@@ -26341,6 +26364,23 @@ function setup(ctx) {
   };
   cleanups.push(() => setOverlayTracking(false));
   let classifyPending = null;
+  const chatBar = ctx.ui.mount("chat_actions");
+  chatBar.style.display = "contents";
+  const chatBarButton = document.createElement("button");
+  chatBarButton.type = "button";
+  chatBarButton.className = "spine-avatars-bar-button";
+  chatBarButton.title = "Reload Spine models";
+  chatBarButton.setAttribute("aria-label", "Reload Spine models");
+  chatBarButton.innerHTML = RELOAD_ICON;
+  chatBarButton.addEventListener("click", () => controller.reloadStage());
+  const syncChatBarButton = () => {
+    const show = settings.global.enabled && settings.global.showReloadButton;
+    if (show && chatBarButton.parentElement !== chatBar)
+      chatBar.replaceChildren(chatBarButton);
+    else if (!show && chatBarButton.parentElement)
+      chatBarButton.remove();
+  };
+  cleanups.push(() => chatBarButton.remove());
   const controller = {
     getSettings: () => settings,
     getModels: () => models,
@@ -26354,6 +26394,7 @@ function setup(ctx) {
       applyBackgroundMode();
       stage.reload();
     },
+    syncChatBarButton: () => syncChatBarButton(),
     importZip: async (status2) => {
       const files = await ctx.uploads.pickFile({
         accept: [".zip", "application/zip"],
