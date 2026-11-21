@@ -25044,14 +25044,25 @@ function button(label, onClick) {
   node.addEventListener("click", onClick);
   return node;
 }
-function checkbox(label, checked, onChange) {
+function iconButton(icon, label, onClick) {
+  const node = button(icon, onClick);
+  node.classList.add("spn-icon-btn");
+  node.title = label;
+  node.setAttribute("aria-label", label);
+  return node;
+}
+function checkbox(label, checked, onChange, hint) {
   const wrap = el("label", "spn-check");
   const input = el("input");
   input.type = "checkbox";
   input.checked = checked;
   input.addEventListener("change", () => onChange(input.checked));
   wrap.appendChild(input);
-  wrap.appendChild(el("span", undefined, label));
+  const text = el("span", "spn-check-text");
+  text.appendChild(el("span", undefined, label));
+  if (hint)
+    text.appendChild(el("span", "spn-hint", hint));
+  wrap.appendChild(text);
   return wrap;
 }
 function select(options, value, onChange) {
@@ -25067,36 +25078,86 @@ function select(options, value, onChange) {
   node.addEventListener("change", () => onChange(node.value));
   return node;
 }
-function slider(label, limits, value, format, onInput) {
-  const root = el("div", "spn-slider");
-  const head = el("div", "spn-slider-head");
-  head.appendChild(el("span", undefined, label));
-  const valueSpan = el("span", "spn-slider-value", format(value));
-  head.appendChild(valueSpan);
-  const input = el("input");
-  input.type = "range";
-  input.min = String(limits.min);
-  input.max = String(limits.max);
-  input.step = String(limits.step);
-  input.value = String(value);
-  input.setAttribute("aria-label", label);
-  input.addEventListener("input", () => {
-    valueSpan.textContent = format(Number(input.value));
-    onInput(Number(input.value));
+function slider(label, options, value, onInput) {
+  const decimals = (String(options.step).split(".")[1] ?? "").length;
+  const clamp = (next) => Number(Math.min(options.max, Math.max(options.min, next)).toFixed(decimals));
+  const range = el("input", "spn-range");
+  range.type = "range";
+  range.min = String(options.min);
+  range.max = String(options.max);
+  range.step = String(options.step);
+  range.setAttribute("aria-label", label);
+  const number = el("input", "spn-number");
+  number.type = "number";
+  number.min = String(options.min);
+  number.max = String(options.max);
+  number.step = String(options.step);
+  number.setAttribute("aria-label", `${label} value`);
+  const reset = options.reset === undefined ? null : iconButton("↺", `Reset to ${options.reset}${options.unit ?? ""}`, () => {
+    show(options.reset);
+    onInput(options.reset);
   });
-  root.appendChild(head);
-  root.appendChild(input);
-  return {
-    root,
-    set(next) {
-      input.value = String(next);
-      valueSpan.textContent = format(next);
-    }
+  const show = (next) => {
+    range.value = String(next);
+    number.value = next.toFixed(decimals);
+    const fill = (next - options.min) / (options.max - options.min) * 100;
+    range.style.setProperty("--spn-fill", `${Math.min(100, Math.max(0, fill))}%`);
+    if (reset)
+      reset.hidden = next === options.reset;
   };
+  range.addEventListener("input", () => {
+    const next = clamp(Number(range.value));
+    show(next);
+    onInput(next);
+  });
+  number.addEventListener("change", () => {
+    const typed = Number(number.value);
+    const next = number.value.trim() === "" || !Number.isFinite(typed) ? Number(range.value) : clamp(typed);
+    show(next);
+    onInput(next);
+  });
+  const head = el("div", "spn-slider-head");
+  head.appendChild(el("span", "spn-slider-label", label));
+  const valueBox = el("span", "spn-slider-value");
+  valueBox.appendChild(number);
+  if (options.unit)
+    valueBox.appendChild(el("span", "spn-unit", options.unit));
+  if (reset)
+    valueBox.appendChild(reset);
+  head.appendChild(valueBox);
+  const wrap = Object.assign(el("div", "spn-slider"), {
+    setValue(next) {
+      show(next);
+    }
+  });
+  wrap.append(head, range);
+  show(value);
+  return wrap;
 }
-function section(title, ...children) {
+var SECTION_STATE_KEY = "spine-avatars:open-sections";
+function loadSectionState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SECTION_STATE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+var sectionState = loadSectionState();
+function section(title, children = [], options = {}) {
   const wrap = el("details", "spn-section");
-  wrap.open = true;
+  if (options.className)
+    wrap.classList.add(options.className);
+  const defaultOpen = options.open ?? true;
+  wrap.open = sectionState[title] ?? defaultOpen;
+  wrap.addEventListener("toggle", () => {
+    if (wrap.open === (sectionState[title] ?? defaultOpen))
+      return;
+    sectionState[title] = wrap.open;
+    try {
+      localStorage.setItem(SECTION_STATE_KEY, JSON.stringify(sectionState));
+    } catch {}
+  });
   wrap.appendChild(el("summary", "spn-section-title", title));
   for (const child of children)
     if (child)
@@ -25105,20 +25166,22 @@ function section(title, ...children) {
 }
 function row(...children) {
   const wrap = el("div", "spn-row");
-  let label = null;
   for (const child of children) {
-    if (typeof child === "string") {
-      label = child;
-      wrap.appendChild(el("span", "spn-label", child));
-      continue;
-    }
-    if (label && (child instanceof HTMLSelectElement || child instanceof HTMLInputElement)) {
-      if (!child.hasAttribute("aria-label"))
-        child.setAttribute("aria-label", label);
-    }
-    label = null;
-    wrap.appendChild(child);
+    wrap.appendChild(typeof child === "string" ? el("span", "spn-label", child) : child);
   }
+  return wrap;
+}
+function field(label, ...controls) {
+  const wrap = el("div", "spn-field");
+  wrap.appendChild(el("span", "spn-label", label));
+  const box = el("div", "spn-field-control");
+  for (const control of controls) {
+    if ((control instanceof HTMLSelectElement || control instanceof HTMLInputElement) && !control.hasAttribute("aria-label")) {
+      control.setAttribute("aria-label", label);
+    }
+    box.appendChild(control);
+  }
+  wrap.appendChild(box);
   return wrap;
 }
 function note(text) {
@@ -25194,7 +25257,6 @@ function animationOptions(description) {
     }))
   ];
 }
-var formatFixed = (digits, suffix = "") => (value) => `${value.toFixed(digits)}${suffix}`;
 
 class SettingsUI {
   controller;
@@ -25249,88 +25311,37 @@ class SettingsUI {
       }));
       root.appendChild(banner);
     }
-    root.appendChild(section("Global", checkbox("Enabled", globals.enabled, (value) => {
-      globals.enabled = value;
-      controller.saveNow();
-      controller.reloadStage();
-    }), checkbox("Show model as chat background", globals.backgroundMode, (value) => {
-      globals.backgroundMode = value;
-      controller.saveNow();
-      controller.applyBackgroundMode();
-    }), checkbox("Auto-send interaction", globals.autoSendInteraction, (value) => {
-      globals.autoSendInteraction = value;
-      controller.saveDebounced();
-    }), row("Emotion detection", select([
-      { value: "llm", label: "LLM classification" },
-      { value: "native", label: "Lumiverse's expression detection" },
-      { value: "off", label: "Off" }
-    ], globals.expressionSource, (value) => {
-      globals.expressionSource = value;
-      controller.saveNow();
-    })), controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below.")));
-    const debug = section("Debug", checkbox("Show bones and bounds", globals.showBounds, (value) => {
-      globals.showBounds = value;
-      controller.saveDebounced();
-    }), row(button("Reload Spine", () => controller.reloadStage())));
-    debug.open = false;
-    root.appendChild(debug);
+    root.appendChild(section("Global", [
+      checkbox("Enabled", globals.enabled, (value) => {
+        globals.enabled = value;
+        controller.saveNow();
+        controller.reloadStage();
+      }),
+      checkbox("Show model as chat background", globals.backgroundMode, (value) => {
+        globals.backgroundMode = value;
+        controller.saveNow();
+        controller.applyBackgroundMode();
+      }, "Draw the model behind the chat messages instead of over them."),
+      checkbox("Reply to click messages", globals.autoSendInteraction, (value) => {
+        globals.autoSendInteraction = value;
+        controller.saveDebounced();
+      }, "When a click posts its message, the character answers it right away."),
+      field("Emotion detection", select([
+        { value: "llm", label: "LLM classification" },
+        { value: "native", label: "Lumiverse's expression detection" },
+        { value: "off", label: "Off" }
+      ], globals.expressionSource, (value) => {
+        globals.expressionSource = value;
+        controller.saveNow();
+      })),
+      note("Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings)."),
+      controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below.")
+    ]));
     if (!controller.usingOverlay()) {
-      const preview = section("Stage preview");
       controller.embeddedHost.classList.add("spn-embedded-host");
-      preview.appendChild(controller.embeddedHost);
-      root.appendChild(preview);
+      root.appendChild(section("Stage preview", [controller.embeddedHost]));
     }
     const models = controller.getModels();
-    const library = el("div");
-    const libraryList = el("div");
-    this.libraryList = libraryList;
-    if (models.length === 0) {
-      library.appendChild(note("No models imported yet. Import a Spine model folder as a .zip archive."));
-    } else {
-      const filter = withLabel(el("input", "spn-input spn-library-filter"), "Filter models");
-      filter.type = "search";
-      filter.placeholder = "Filter models…";
-      filter.value = this.libraryFilter;
-      filter.addEventListener("input", () => {
-        this.libraryFilter = filter.value;
-        this.renderLibraryList(libraryList);
-      });
-      const sort = withLabel(select(SORT_OPTIONS, globals.librarySort, (value) => {
-        globals.librarySort = value;
-        controller.saveDebounced();
-        this.renderLibraryList(libraryList);
-      }), "Sort models");
-      const views = el("div", "spn-segmented");
-      views.setAttribute("role", "group");
-      views.setAttribute("aria-label", "Library view");
-      const viewButtons = ["tiles", "list"].map((view) => {
-        const viewButton = button(view === "tiles" ? "Tiles" : "List", () => {
-          globals.libraryView = view;
-          controller.saveDebounced();
-          for (const other of viewButtons) {
-            other.classList.toggle("spn-active", other === viewButton);
-            other.setAttribute("aria-pressed", String(other === viewButton));
-          }
-          this.renderLibraryList(libraryList);
-        });
-        const active = libraryView(globals.libraryView) === view;
-        viewButton.classList.toggle("spn-active", active);
-        viewButton.setAttribute("aria-pressed", String(active));
-        views.appendChild(viewButton);
-        return viewButton;
-      });
-      library.appendChild(row(filter, sort, views));
-    }
-    library.appendChild(libraryList);
-    this.renderLibraryList(libraryList);
-    const importStatus = el("span", "spn-dim", "");
-    library.appendChild(row(button("Import model (.zip)", () => {
-      this.controller.importZip((text) => {
-        importStatus.textContent = text;
-      });
-    }), importStatus));
-    library.appendChild(note("Zip the exported model folder: the skeleton (.skel or .json), its .atlas and the atlas page images. " + "Spine 4.1 exports are supported. A model's thumbnail is taken the first time it's shown."));
-    root.appendChild(section("Model library", library));
     const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
     const inChat = controller.stage.getChatContext().characterIds;
@@ -25392,10 +25403,13 @@ class SettingsUI {
           controller.reloadStage();
         this.render();
       }, { label: "Model", placeholder: "No model", searchPlaceholder: "Search models…", noneLabel: "No model" });
-      bindingSection.appendChild(row("Character", characterSelect));
-      bindingSection.appendChild(row("Model", modelSelect));
+      bindingSection.appendChild(field("Character", characterSelect));
+      bindingSection.appendChild(field("Model", modelSelect));
+      if (models.length === 0) {
+        bindingSection.appendChild(note("Your library is empty: import a model in Model library below first."));
+      }
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "member with a model (Spine or, with the Live2D Avatars extension, Live2D), in member order; " + "zoom, X and Y offset and Fit to canvas work within that column. Where models overlap, Send to " + "front and Send to back in Model settings choose which one is drawn on top."));
+        bindingSection.appendChild(note("Group chat: every member with a model is shown, side by side in equal columns in member order " + "(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "spn-dim", this.fileStatusText);
@@ -25419,24 +25433,34 @@ class SettingsUI {
         });
       });
       importButton.title = "Load model and animation settings for this character from a file";
-      bindingSection.appendChild(row(exportButton, importButton, fileStatus));
-      bindingSection.appendChild(row(button("Clear model settings for this character", () => {
+      const resetButton = button("Reset settings", () => {
         const characterId = this.selectedCharacterId;
         if (!characterId)
           return;
-        delete settings.characterModelsSettings[characterId];
-        controller.saveNow();
-        if (this.isOnStage(characterId))
-          controller.reloadStage();
-        this.render();
-      })));
+        controller.confirm({
+          title: "Reset model settings",
+          message: `Reset ${characterName()}’s settings for every model to the defaults? Position, zoom, ` + "skin, animations and emotion mappings are all cleared. The model stays assigned.",
+          confirmLabel: "Reset"
+        }).then((confirmed) => {
+          if (!confirmed)
+            return;
+          delete settings.characterModelsSettings[characterId];
+          controller.saveNow();
+          if (this.isOnStage(characterId))
+            controller.reloadStage();
+          this.render();
+        });
+      });
+      resetButton.classList.add("spn-btn-danger");
+      resetButton.title = "Clear this character’s model settings back to the defaults";
+      bindingSection.appendChild(row(exportButton, importButton, resetButton, fileStatus));
     }
-    root.appendChild(section("Character model", bindingSection));
+    root.appendChild(section("Character model", [bindingSection]));
     if (this.selectedCharacterId && this.selectedModelId) {
       const host = el("div");
       const status2 = note("Loading model details…");
       host.appendChild(status2);
-      root.appendChild(section("Model settings", host));
+      root.appendChild(section("Model settings", [host]));
       const characterId = this.selectedCharacterId;
       const modelId = this.selectedModelId;
       const showProgress = () => {
@@ -25465,20 +25489,98 @@ class SettingsUI {
         host.appendChild(note(`Could not load model details: ${String(error)}`));
       }).finally(() => window.clearInterval(progressTimer));
     }
+    const library = el("div");
+    const libraryList = el("div");
+    this.libraryList = libraryList;
+    const importStatus = el("span", "spn-dim", "");
+    importStatus.setAttribute("role", "status");
+    const importButton = button("Import model (.zip)", () => {
+      this.controller.importZip((text) => {
+        importStatus.textContent = text;
+      });
+    });
+    importButton.classList.add("spn-btn-primary");
+    importButton.title = "Zip the exported model folder: the skeleton (.skel or .json), its .atlas and the atlas page images";
+    library.appendChild(row(importButton, importStatus));
+    if (models.length === 0) {
+      library.appendChild(note("No models yet. Zip an exported Spine model folder (the skeleton .skel or .json, its .atlas and the " + `atlas page images) and import it. Spine ${SUPPORTED_SPINE_VERSIONS.join(" and ")} exports are supported.`));
+    } else {
+      const filter = el("input", "spn-input spn-library-filter");
+      filter.type = "search";
+      filter.placeholder = "Filter models…";
+      filter.setAttribute("aria-label", "Filter models");
+      filter.value = this.libraryFilter;
+      filter.addEventListener("input", () => {
+        this.libraryFilter = filter.value;
+        this.renderLibraryList(libraryList);
+      });
+      const sort = select(SORT_OPTIONS, globals.librarySort, (value) => {
+        globals.librarySort = value;
+        controller.saveDebounced();
+        this.renderLibraryList(libraryList);
+      });
+      sort.title = "Sort models";
+      sort.setAttribute("aria-label", "Sort models");
+      const views = el("div", "spn-segmented");
+      views.setAttribute("role", "group");
+      views.setAttribute("aria-label", "Library view");
+      const viewButtons = ["tiles", "list"].map((view) => {
+        const viewButton = button(view === "tiles" ? "Tiles" : "List", () => {
+          globals.libraryView = view;
+          controller.saveDebounced();
+          for (const other of viewButtons) {
+            other.classList.toggle("spn-active", other === viewButton);
+            other.setAttribute("aria-pressed", String(other === viewButton));
+          }
+          this.renderLibraryList(libraryList);
+        });
+        const active = libraryView(globals.libraryView) === view;
+        viewButton.classList.toggle("spn-active", active);
+        viewButton.setAttribute("aria-pressed", String(active));
+        views.appendChild(viewButton);
+        return viewButton;
+      });
+      library.appendChild(row(filter, sort, views));
+    }
+    library.appendChild(libraryList);
+    this.renderLibraryList(libraryList);
+    if (models.length > 0) {
+      library.appendChild(note(`Spine ${SUPPORTED_SPINE_VERSIONS.join(" and ")} exports are supported. A model’s thumbnail is taken ` + "the first time it’s shown; the highlighted one is the selected character’s."));
+    }
+    root.appendChild(section("Model library", [library]));
     const testInput = el("input", "spn-input");
     testInput.type = "text";
     testInput.placeholder = "Type a message to classify…";
+    testInput.setAttribute("aria-label", "Message to classify");
     const testResult = el("span", "spn-dim", "");
-    const test = section("Test emotion classification", row(testInput, button("Classify", () => {
-      testResult.textContent = "…";
+    testResult.setAttribute("role", "status");
+    const classifyButton = button("Classify", () => {
+      if (!testInput.value.trim()) {
+        testResult.textContent = "Type a message first.";
+        return;
+      }
+      testResult.textContent = "Classifying…";
+      classifyButton.disabled = true;
       controller.classifyTest(testInput.value).then((label) => {
-        testResult.textContent = `→ ${label}`;
+        testResult.textContent = `Emotion: ${label}`;
       }).catch((error) => {
         testResult.textContent = String(error);
+      }).finally(() => {
+        classifyButton.disabled = false;
       });
-    }), testResult));
-    test.open = false;
-    root.appendChild(test);
+    });
+    testInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter")
+        classifyButton.click();
+    });
+    root.appendChild(section("Test emotion classification", [row(testInput, classifyButton), testResult], { open: false }));
+    root.appendChild(section("Debug", [
+      checkbox("Show bones and bounds", globals.showBounds, (value) => {
+        globals.showBounds = value;
+        controller.saveDebounced();
+      }),
+      row(button("Reload Spine", () => controller.reloadStage()))
+    ], { open: false }));
     for (const mount of this.pendingMounts.splice(0))
       mount();
   }
@@ -25500,10 +25602,13 @@ class SettingsUI {
       return;
     }
     const boundTo = (modelId) => Object.values(settings.characterModelMapping).filter((bound) => bound === modelId).length;
+    const usedBy = (count) => count ? `used by ${count}` : "unused";
+    const current = this.selectedCharacterId ? settings.characterModelMapping[this.selectedCharacterId] : undefined;
     const remove = (model, label) => {
       const removeButton = withLabel(button(label, () => {
         controller.deleteModel(model.id);
       }), `Delete ${model.name}`);
+      removeButton.classList.add("spn-btn-danger");
       removeButton.title = `Delete ${model.name}`;
       return removeButton;
     };
@@ -25511,13 +25616,15 @@ class SettingsUI {
       const grid = el("div", "spn-tiles");
       for (const model of shown) {
         const tile = el("div", "spn-tile");
+        tile.dataset.modelId = model.id;
+        tile.classList.toggle("spn-current", model.id === current);
         const used = boundTo(model.id);
         tile.title = `${model.name}
 ${modelSummary(model)}${used ? `
 Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
         tile.appendChild(thumbnail(model, "spn-tile-thumb"));
         tile.appendChild(el("div", "spn-tile-name", model.name));
-        tile.appendChild(el("div", "spn-tile-meta", megabytes(model)));
+        tile.appendChild(el("div", "spn-tile-meta", `${megabytes(model)} · ${usedBy(used)}`));
         const removeButton = remove(model, "✕");
         removeButton.classList.add("spn-tile-delete");
         tile.appendChild(removeButton);
@@ -25528,9 +25635,11 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     }
     for (const model of shown) {
       const line = el("div", "spn-list-row");
+      line.dataset.modelId = model.id;
+      line.classList.toggle("spn-current", model.id === current);
       const text = el("div", "spn-list-text");
       text.appendChild(el("div", "spn-model-name", model.name));
-      text.appendChild(el("div", "spn-dim", `Spine ${model.spineVersion} · ${model.fileCount} files · ${megabytes(model)}`));
+      text.appendChild(el("div", "spn-dim", `Spine ${model.spineVersion} · ${model.fileCount} files · ${megabytes(model)} · ${usedBy(boundTo(model.id))}`));
       line.append(thumbnail(model, "spn-list-thumb"), text, remove(model, "Delete"));
       host.appendChild(line);
     }
@@ -25570,6 +25679,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     const controller = this.controller;
     const stage = controller.stage;
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
+    const defaults = defaultModelSettings(description);
     const isLive = () => stage.isOnStage(characterId, modelId);
     const notLiveReason = () => {
       if (isLive())
@@ -25589,185 +25699,255 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     };
     const changed = () => controller.saveDebounced();
     const limits = SETTINGS_LIMITS;
-    const renderScale = slider("Render scale", limits.renderScale, modelSettings.renderScale, formatFixed(2, "×"), (value) => {
+    const renderScale = slider("Render scale", { ...limits.renderScale, unit: "×", reset: defaults.renderScale }, modelSettings.renderScale, (value) => {
       modelSettings.renderScale = value;
       changed();
     });
-    const zoom = slider("Zoom", limits.zoom, modelSettings.zoom, formatFixed(2, "×"), (value) => {
+    const zoom = slider("Zoom", { ...limits.zoom, unit: "×", reset: defaults.zoom }, modelSettings.zoom, (value) => {
       modelSettings.zoom = value;
       changed();
     });
-    const rotation = slider("Rotation", limits.rotation, modelSettings.rotation, formatFixed(0, "°"), (value) => {
+    const rotation = slider("Rotation", { ...limits.rotation, unit: "°", reset: defaults.rotation }, modelSettings.rotation, (value) => {
       modelSettings.rotation = value;
       changed();
     });
-    const speed = slider("Playback speed", limits.speed, modelSettings.speed, formatFixed(2, "×"), (value) => {
+    const speed = slider("Playback speed", { ...limits.speed, unit: "×", reset: defaults.speed }, modelSettings.speed, (value) => {
       modelSettings.speed = value;
       changed();
     });
-    const offsetX = slider("X offset", limits.offset, modelSettings.x, formatFixed(0, "%"), (value) => {
+    const offsetX = slider("X offset", { ...limits.offset, unit: "%", reset: 0 }, modelSettings.x, (value) => {
       modelSettings.x = value;
       changed();
     });
-    const offsetY = slider("Y offset", limits.offset, modelSettings.y, formatFixed(0, "%"), (value) => {
+    const offsetY = slider("Y offset", { ...limits.offset, unit: "%", reset: 0 }, modelSettings.y, (value) => {
       modelSettings.y = value;
       changed();
     });
     this.syncLayout = () => {
-      zoom.set(modelSettings.zoom);
-      offsetX.set(modelSettings.x);
-      offsetY.set(modelSettings.y);
+      zoom.setValue(modelSettings.zoom);
+      offsetX.setValue(modelSettings.x);
+      offsetY.setValue(modelSettings.y);
     };
     const viewStatus = statusLine();
     const view = el("div");
-    view.appendChild(row(button("Fit to canvas", () => onStage(viewStatus, () => {
+    const fitButton = button("Fit to canvas", () => onStage(viewStatus, () => {
       if (!stage.fitToCanvas(characterId, modelId)) {
         viewStatus.say("The stage is hidden or has no size yet. Show it, then try again.");
         return;
       }
       this.syncLayout?.();
-    })), button("Center model", () => {
+    }));
+    fitButton.title = "Make the model as large as fits, at its current rotation, and center it";
+    const centerButton = button("Center model", () => {
       modelSettings.x = 0;
       modelSettings.y = 0;
       changed();
       viewStatus.say("");
       this.syncLayout?.();
-    }), button("Update thumbnail", () => onStage(viewStatus, () => {
+    });
+    centerButton.title = "Set X and Y offset back to 0";
+    const thumbButton = button("Update thumbnail", () => onStage(viewStatus, () => {
       viewStatus.say(controller.updateThumbnail(characterId, modelId) ? "Thumbnail updated." : "The stage is hidden or has no size yet. Show it, then try again.");
-    })), viewStatus.root));
+    }));
+    thumbButton.title = "Take the library thumbnail again from the model as it is now";
+    view.appendChild(row(fitButton, centerButton, thumbButton));
     if (stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
-      const stackStatus = statusLine();
-      const restack = (toFront) => onStage(stackStatus, () => {
+      const restack = (toFront) => onStage(viewStatus, () => {
         if (!stage.restack(characterId, toFront))
-          stackStatus.say(toFront ? "Already in front." : "Already at the back.");
+          viewStatus.say(toFront ? "Already in front." : "Already at the back.");
       });
       const front = button("Send to front", () => restack(true));
       front.title = "Draw this model over the other models in the chat where they overlap";
       const back = button("Send to back", () => restack(false));
       back.title = "Draw this model under the other models in the chat where they overlap";
-      view.appendChild(row(front, back, stackStatus.root));
+      view.appendChild(row(front, back));
     }
-    view.append(renderScale.root, zoom.root, rotation.root, speed.root, offsetX.root, offsetY.root);
+    view.appendChild(viewStatus.root);
+    view.append(zoom, offsetX, offsetY, rotation, speed, renderScale);
     view.appendChild(checkbox("Premultiplied alpha", modelSettings.premultipliedAlpha, (value) => {
       modelSettings.premultipliedAlpha = value;
       changed();
-    }));
-    view.appendChild(note(`Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model's size. ` + `Drag the model to move it. This model's atlas says premultiplied alpha is ${description.pma ? "on" : "off"}; ` + `if edges look dark or haloed, flip the toggle.`));
-    host.appendChild(section("View", view));
+    }, `This model’s atlas says ${description.pma ? "on" : "off"}. If edges look dark or haloed, flip it.`));
+    view.appendChild(note("Drag the model on the stage to move it. Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model’s size."));
+    host.appendChild(section("View", [view]));
     const options = animationOptions(description);
     const animationStatus = statusLine();
     const emotionStatus = statusLine();
-    const preview = (label, status2, name) => {
-      const play = button("▶", () => onStage(status2, () => stage.playAnimation(characterId, name())));
-      play.setAttribute("aria-label", `Play ${label} animation`);
-      return play;
-    };
+    const preview = (label, status2, name) => iconButton("▶", `Play ${label} animation`, () => onStage(status2, () => stage.playAnimation(characterId, name())));
     const animations = el("div");
     animations.appendChild(animationStatus.root);
     if (description.skins.length > 1) {
-      animations.appendChild(row("Skin", select(description.skins.map((skin) => ({ value: skin === "default" ? "" : skin, label: skin })), modelSettings.skin, (value) => {
+      animations.appendChild(field("Skin", select(description.skins.map((skin) => ({ value: skin === "default" ? "" : skin, label: skin })), modelSettings.skin, (value) => {
         modelSettings.skin = value;
         changed();
         if (isLive())
           stage.applySkin(characterId);
       })));
     }
-    animations.appendChild(row("Idle (loops)", select(options, modelSettings.animation_idle, (value) => {
+    animations.appendChild(field("Idle (loops)", select(options, modelSettings.animation_idle, (value) => {
       modelSettings.animation_idle = value;
       changed();
       if (isLive())
         stage.applyIdle(characterId);
     })));
-    animations.appendChild(row("On chat open", select(options, modelSettings.animation_starter.animation, (value) => {
+    animations.appendChild(field("On chat open", select(options, modelSettings.animation_starter.animation, (value) => {
       modelSettings.animation_starter.animation = value;
       changed();
     }), preview("chat open", animationStatus, () => modelSettings.animation_starter.animation)));
-    animations.appendChild(slider("Delay before it plays (ms)", { min: 0, max: 1e4, step: 100 }, modelSettings.animation_starter.delay, formatFixed(0), (value) => {
+    animations.appendChild(slider("Delay before it plays", { min: 0, max: 1e4, step: 100, unit: "ms", reset: 0 }, modelSettings.animation_starter.delay, (value) => {
       modelSettings.animation_starter.delay = value;
       changed();
-    }).root);
+    }));
+    animations.appendChild(field("On click", select(options, modelSettings.animation_click.animation, (value) => {
+      modelSettings.animation_click.animation = value;
+      changed();
+    }), preview("click", animationStatus, () => modelSettings.animation_click.animation)));
     const clickMessage = el("input", "spn-input");
     clickMessage.type = "text";
-    clickMessage.placeholder = "Message sent when clicked (optional)";
+    clickMessage.placeholder = "Optional";
     clickMessage.value = modelSettings.animation_click.message;
     clickMessage.addEventListener("change", () => {
       modelSettings.animation_click.message = clickMessage.value;
       changed();
     });
-    animations.appendChild(row("On click", select(options, modelSettings.animation_click.animation, (value) => {
-      modelSettings.animation_click.animation = value;
-      changed();
-    }), preview("click", animationStatus, () => modelSettings.animation_click.animation)));
-    animations.appendChild(row("Click message", clickMessage));
-    animations.appendChild(row("While talking", select(options, modelSettings.animation_talk, (value) => {
+    animations.appendChild(field("Click message", clickMessage));
+    animations.appendChild(field("While talking", select(options, modelSettings.animation_talk, (value) => {
       modelSettings.animation_talk = value;
       changed();
     })));
-    animations.appendChild(slider("Talk time per character (ms)", { min: 0, max: 100, step: 1 }, modelSettings.talk_time_per_character, formatFixed(0), (value) => {
+    animations.appendChild(slider("Talk time per character", { min: 0, max: 100, step: 1, unit: "ms", reset: defaults.talk_time_per_character }, modelSettings.talk_time_per_character, (value) => {
       modelSettings.talk_time_per_character = value;
       changed();
-    }).root);
-    animations.appendChild(note("Chat-open, click and emotion animations play once, then the idle loop resumes. " + "The talking animation plays on a layer above them."));
-    host.appendChild(section("Animations", animations));
+    }));
+    animations.appendChild(note("Chat-open, click and emotion animations play once, then the idle loop resumes. " + "The talking animation plays on a layer above them. The click message, if any, is posted to the chat."));
+    host.appendChild(section("Animations", [animations]));
     const classify = el("div");
     classify.appendChild(emotionStatus.root);
+    const grid = el("div", "spn-mapping-grid");
+    grid.setAttribute("role", "table");
+    grid.setAttribute("aria-label", "Emotion mappings");
+    const head = el("div", "spn-mapping-head");
+    head.setAttribute("role", "row");
+    for (const title of ["Emotion", "Animation", ""]) {
+      const cell = el("span", undefined, title);
+      cell.setAttribute("role", "columnheader");
+      head.appendChild(cell);
+    }
+    grid.appendChild(head);
     for (const label of CLASSIFY_EXPRESSIONS) {
-      const current = modelSettings.classify_mapping[label] ?? "none";
-      classify.appendChild(row(el("span", "spn-emotion", label), withLabel(select(options, current, (value) => {
+      const line = el("div", "spn-mapping-row");
+      line.setAttribute("role", "row");
+      const mark = () => line.classList.toggle("spn-unset", (modelSettings.classify_mapping[label] ?? "none") === "none");
+      const choice = withLabel(select(options, modelSettings.classify_mapping[label] ?? "none", (value) => {
         modelSettings.classify_mapping[label] = value;
         changed();
-      }), `Animation for ${label}`), preview(label, emotionStatus, () => modelSettings.classify_mapping[label] ?? "none")));
+        mark();
+      }), `Animation for ${label}`);
+      line.append(el("span", "spn-emotion", label), choice, preview(label, emotionStatus, () => modelSettings.classify_mapping[label] ?? "none"));
+      mark();
+      grid.appendChild(line);
     }
-    classify.appendChild(note("Emotions whose names match one of the model’s animations are mapped on first load."));
-    const classifySection = section("Emotion mappings", classify);
-    classifySection.open = false;
-    host.appendChild(classifySection);
+    classify.appendChild(grid);
+    classify.appendChild(note("A new character message plays the animation mapped to its emotion. Dimmed rows play nothing. " + "Emotions whose names match one of the model’s animations are mapped on first load."));
+    host.appendChild(section("Emotion mappings", [classify], { open: false }));
   }
 }
 var UI_CSS = `
-.spn-root { padding: 10px 12px; color: var(--lumiverse-text); font-size: 13px; }
-.spn-section { margin-bottom: 10px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 8px 10px; background: var(--lumiverse-fill-subtle); }
-.spn-section-title { cursor: pointer; font-weight: 600; margin: 0 0 4px; color: var(--lumiverse-text); }
-.spn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }
-.spn-label { color: var(--lumiverse-text-muted); min-width: 90px; }
-.spn-note { color: var(--lumiverse-text-dim); font-size: 12px; margin: 6px 0; }
+.spn-root { padding: 10px 12px; color: var(--lumiverse-text); font-size: 13px; container-type: inline-size; }
+.spn-section { margin-bottom: 10px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 0 10px; background: var(--lumiverse-fill-subtle); }
+.spn-section[open] { padding-bottom: 8px; }
+.spn-section .spn-section { margin: 8px 0 0; background: transparent; }
+.spn-section-title { display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 600; padding: 8px 0; color: var(--lumiverse-text); list-style: none; user-select: none; }
+.spn-section-title::-webkit-details-marker { display: none; }
+.spn-section-title::before { content: ''; flex: none; width: 6px; height: 6px; margin: 0 3px 0 1px; border-right: 1.5px solid var(--lumiverse-text-dim); border-bottom: 1.5px solid var(--lumiverse-text-dim); transform: rotate(-45deg); transition: transform var(--lumiverse-transition-fast, 0.15s); }
+.spn-section[open] > .spn-section-title::before { transform: rotate(45deg); }
+.spn-section-title:hover::before { border-color: var(--lumiverse-text); }
+.spn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 6px 0; }
+.spn-field { display: grid; grid-template-columns: minmax(72px, 34%) minmax(0, 1fr); align-items: center; gap: 8px; margin: 6px 0; }
+.spn-field-control { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.spn-field-control > .spn-select, .spn-field-control > .spn-input, .spn-field-control > .spn-picker { flex: 1; min-width: 0; max-width: none; width: 100%; }
+.spn-label { color: var(--lumiverse-text-muted); }
+.spn-note { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.45; margin: 6px 0; }
 .spn-dim { color: var(--lumiverse-text-dim); font-size: 12px; }
-.spn-btn { padding: 4px 10px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); cursor: pointer; }
-.spn-btn:hover { border-color: var(--lumiverse-border-hover); }
-.spn-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; cursor: pointer; }
-.spn-select { max-width: 100%; min-width: 140px; padding: 3px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); }
-.spn-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); }
-.spn-slider { margin: 8px 0; }
-.spn-slider input[type=range] { width: 100%; accent-color: var(--lumiverse-accent); }
-.spn-slider-head { display: flex; justify-content: space-between; color: var(--lumiverse-text-muted); }
-.spn-slider-value { color: var(--lumiverse-text); font-variant-numeric: tabular-nums; }
-.spn-emotion { min-width: 110px; color: var(--lumiverse-text-muted); }
+.spn-dim:empty { display: none; }
+.spn-btn { padding: 4px 10px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); cursor: pointer; font: inherit; line-height: 1.4; }
+.spn-btn:hover:not(:disabled) { border-color: var(--lumiverse-border-hover); background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); }
+.spn-btn:focus-visible, .spn-select:focus-visible, .spn-input:focus-visible, .spn-number:focus-visible, .spn-section-title:focus-visible { outline: 2px solid var(--lumiverse-primary, var(--lumiverse-accent)); outline-offset: 1px; }
+.spn-btn-primary { border-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
+.spn-btn-danger:hover:not(:disabled) { border-color: var(--lumiverse-danger, #e5484d); color: var(--lumiverse-danger, #e5484d); }
+.spn-icon-btn { flex: none; width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
+.spn-icon-btn[hidden] { display: none; }
+.spn-check { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; cursor: pointer; }
+.spn-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
+.spn-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.spn-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.spn-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
+.spn-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
+.spn-slider { margin: 6px 0 2px; }
+.spn-slider-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--lumiverse-text-muted); min-height: 28px; }
+.spn-slider-value { display: inline-flex; align-items: center; gap: 4px; color: var(--lumiverse-text); }
+.spn-number { width: 64px; padding: 2px 6px; border-radius: var(--lumiverse-radius); border: 1px solid transparent; background: transparent; color: var(--lumiverse-text); font: inherit; font-variant-numeric: tabular-nums; text-align: right; -moz-appearance: textfield; }
+.spn-number::-webkit-inner-spin-button, .spn-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.spn-number:hover, .spn-number:focus { border-color: var(--lumiverse-border); background: var(--lumiverse-fill); }
+.spn-unit { color: var(--lumiverse-text-dim); min-width: 1ch; }
+.spn-slider-value .spn-icon-btn { width: 24px; height: 24px; font-size: 13px; }
+.spn-range { display: block; width: 100%; margin: 0; }
+@media (pointer: fine) { .spn-root input.spn-range { min-height: 24px; } }
+.spn-root input.spn-range::-webkit-slider-runnable-track { background: linear-gradient(to right, var(--lumiverse-primary, var(--lumiverse-accent)) var(--spn-fill, 0%), var(--lumiverse-border) var(--spn-fill, 0%)); }
+.spn-root input.spn-range::-moz-range-track { background: var(--lumiverse-border); }
+.spn-root input.spn-range::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--lumiverse-primary, var(--lumiverse-accent)); }
+@media (pointer: fine) { .spn-root input.spn-range::-webkit-slider-thumb { width: 16px; height: 16px; margin-top: -6px; } .spn-root input.spn-range::-moz-range-thumb { width: 16px; height: 16px; } }
+.spn-emotion { color: var(--lumiverse-text-muted); }
+.spn-input.spn-area-name { flex: 1 1 100px; min-width: 80px; }
 .spn-model-name { font-weight: 600; }
-.spn-banner { border: 1px solid var(--lumiverse-accent); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
+.spn-anim { border-top: 1px solid var(--lumiverse-border); padding-top: 4px; margin-top: 8px; }
+.spn-anim:first-of-type { border-top: none; margin-top: 0; }
+.spn-anim-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 30px; }
+.spn-anim-title { font-weight: 600; color: var(--lumiverse-text-muted); margin-top: 6px; }
+.spn-anim-head .spn-anim-title { margin: 0; }
+.spn-mapping-grid { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 6px; align-items: center; margin: 6px 0; }
+.spn-mapping-head, .spn-mapping-row { display: contents; }
+.spn-mapping-head > span { color: var(--lumiverse-text-dim); font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spn-mapping-row > .spn-select { width: 100%; font-size: 12px; }
+.spn-mapping-row.spn-unset > .spn-emotion, .spn-mapping-row.spn-unset > .spn-select { opacity: 0.55; }
+.spn-mapping { border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 6px 8px; margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
+.spn-mapping-top { display: flex; align-items: center; gap: 6px; }
+.spn-mapping-name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spn-mapping-choices { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
+.spn-mapping-choices > .spn-select { width: 100%; }
+.spn-mapping > .spn-input { min-width: 0; }
+.spn-banner { border: 1px solid var(--lumiverse-primary, var(--lumiverse-accent)); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
 .spn-banner-title { font-weight: 600; margin-bottom: 4px; }
 .spn-banner-line { color: var(--lumiverse-text-muted); font-size: 12px; margin: 2px 0 6px; }
 .spn-segmented { display: inline-flex; }
 .spn-segmented .spn-btn { border-radius: 0; }
 .spn-segmented .spn-btn:first-child { border-radius: var(--lumiverse-radius) 0 0 var(--lumiverse-radius); }
 .spn-segmented .spn-btn:last-child { border-radius: 0 var(--lumiverse-radius) var(--lumiverse-radius) 0; margin-left: -1px; }
-.spn-btn.spn-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-accent); }
+.spn-btn.spn-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-primary, var(--lumiverse-accent)); position: relative; }
 .spn-btn:disabled { opacity: 0.5; cursor: default; }
-.spn-library-filter { min-width: 140px; }
-.spn-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin: 8px 0; }
+.spn-library-filter { min-width: 120px; }
+.spn-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin: 8px 0; }
 .spn-tile { position: relative; display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 4px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill); }
+.spn-tile.spn-current, .spn-list-row.spn-current { border-color: var(--lumiverse-primary, var(--lumiverse-accent)); box-shadow: 0 0 0 1px var(--lumiverse-primary, var(--lumiverse-accent)); }
 .spn-tile-delete { position: absolute; top: 6px; right: 6px; padding: 0 6px !important; font-size: 11px; line-height: 18px; opacity: 0.55; }
 .spn-tile:hover .spn-tile-delete, .spn-tile-delete:focus-visible { opacity: 1; }
+.spn-tile-meta { color: var(--lumiverse-text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spn-tile-thumb { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); }
 .spn-tile-name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.spn-tile-meta { color: var(--lumiverse-text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.spn-list-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.spn-list-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; padding: 4px; border: 1px solid transparent; border-radius: var(--lumiverse-radius); }
 .spn-list-text { flex: 1; min-width: 0; }
 .spn-list-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spn-list-thumb { width: 32px; height: 32px; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); flex: none; }
 .spn-thumb-empty { display: flex; align-items: center; justify-content: center; color: var(--lumiverse-text-dim); font-weight: 600; font-size: 20px; }
 .spn-list-thumb.spn-thumb-empty { font-size: 14px; }
-.spn-picker { flex: 1; min-width: 180px; max-width: 360px; }
+.spn-picker { flex: 1; min-width: 160px; max-width: 360px; }
 .spn-embedded-host { position: relative; width: 100%; height: 420px; overflow: hidden; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); }
+@container (max-width: 300px) {
+  .spn-field { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .spn-mapping-grid { grid-template-columns: minmax(0, 1fr) auto; }
+  .spn-mapping-head > span:first-child { display: none; }
+  .spn-mapping-row > .spn-emotion { grid-column: 1 / -1; margin-top: 4px; }
+}
 `;
 
 // src/frontend/tus.ts
@@ -26061,6 +26241,10 @@ function setup(ctx) {
       } catch (error) {
         status2(`Upload failed: ${String(error)}`);
       }
+    },
+    confirm: async ({ title, message, confirmLabel }) => {
+      const { confirmed } = await ctx.ui.showConfirm({ title, message, variant: "danger", confirmLabel });
+      return confirmed;
     },
     deleteModel: async (modelId) => {
       const record = models.find((model) => model.id === modelId);

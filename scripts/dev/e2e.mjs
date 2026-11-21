@@ -167,7 +167,7 @@ async function setCheckbox(text, checked) {
   await page.evaluate(
     ({ text, checked }) => {
       const label = [...document.querySelectorAll('.spn-root label.spn-check')].find(
-        (node) => node.textContent === text,
+        (node) => node.querySelector('.spn-check-text > span')?.textContent === text,
       );
       const input = label?.querySelector('input');
       if (!input) throw new Error(`No checkbox "${text}"`);
@@ -846,7 +846,7 @@ async function runGroup() {
       return values.find((v) => /run|walk|jump|talk/i.test(v)) ?? values[0] ?? null;
     });
     await selectByLabel('While talking', talkAnimation);
-    await setSlider('Talk time per character (ms)', 100);
+    await setSlider('Talk time per character', 100);
   }
   await page.waitForTimeout(1500);
   const quiet = await columnInfo(members.length, 6);
