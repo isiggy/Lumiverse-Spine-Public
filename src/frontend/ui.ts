@@ -30,6 +30,8 @@ export interface UIController {
   saveDebounced(): void;
   saveNow(): void;
   reloadStage(): void;
+  /** Show or hide the reload button in the chat's menu bar to match the settings. */
+  syncChatBarButton(): void;
   importZip(status: (text: string) => void): Promise<void>;
   deleteModel(modelId: string): Promise<void>;
   classifyTest(text: string): Promise<string>;
@@ -275,6 +277,11 @@ function note(text: string): HTMLParagraphElement {
   return el('p', 'spn-note', text);
 }
 
+/** An explanation that the Show help text setting hides. */
+function help(text: string): HTMLParagraphElement {
+  return el('p', 'spn-note spn-help', text);
+}
+
 
 // ── model library helpers ───────────────────────────────────────────────────
 
@@ -421,6 +428,8 @@ export class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add('spn-root');
+    root.classList.toggle('spn-hide-help', !this.controller.getSettings().global.showHelp);
+    this.controller.syncChatBarButton();
     this.syncLayout = null;
     const generation = ++this.renderGeneration;
 
@@ -452,6 +461,7 @@ export class SettingsUI {
           globals.enabled = value;
           controller.saveNow();
           controller.reloadStage();
+          controller.syncChatBarButton();
         }),
         checkbox(
           'Show model as chat background',
@@ -487,10 +497,41 @@ export class SettingsUI {
             },
           ),
         ),
-        note('Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings).'),
+        help('Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings).'),
         controller.usingOverlay()
           ? null
           : note('Overlay permission not granted — the avatar renders in the preview box below.'),
+        checkbox(
+          'Show help text',
+          globals.showHelp,
+          (value) => {
+            globals.showHelp = value;
+            controller.saveDebounced();
+            root.classList.toggle('spn-hide-help', !value);
+          },
+          'The explanations under the settings, like this one.',
+        ),
+      ]),
+    );
+
+    // ── Debug ──
+    root.appendChild(
+      section('Debug', [
+        checkbox('Show bones and bounds', globals.showBounds, (value) => {
+          globals.showBounds = value;
+          controller.saveDebounced();
+        }),
+        checkbox(
+          'Reload button in the chat menu bar',
+          globals.showReloadButton,
+          (value) => {
+            globals.showReloadButton = value;
+            controller.saveDebounced();
+            controller.syncChatBarButton();
+          },
+          'Adds a button that reloads the Spine models next to the chat’s other icons, above the message input.',
+        ),
+        row(button('Reload Spine', () => controller.reloadStage())),
       ]),
     );
 
@@ -583,7 +624,7 @@ export class SettingsUI {
       }
       if (isGroup) {
         bindingSection.appendChild(
-          note(
+          help(
             'Group chat: every member with a model is shown, side by side in equal columns in member order ' +
               '(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, ' +
               'and X and Y offset and Fit to canvas work within that column.',
@@ -738,7 +779,7 @@ export class SettingsUI {
     this.renderLibraryList(libraryList);
     if (models.length > 0) {
       library.appendChild(
-        note(
+        help(
           `Spine ${SUPPORTED_SPINE_VERSIONS.join(' and ')} exports are supported. A model’s thumbnail is taken ` +
             'the first time it’s shown; the highlighted one is the selected character’s.',
         ),
@@ -783,20 +824,6 @@ export class SettingsUI {
       ),
     );
 
-    // ── Debug ──
-    root.appendChild(
-      section(
-        'Debug',
-        [
-          checkbox('Show bones and bounds', globals.showBounds, (value) => {
-            globals.showBounds = value;
-            controller.saveDebounced();
-          }),
-          row(button('Reload Spine', () => controller.reloadStage())),
-        ],
-        { open: false },
-      ),
-    );
 
     for (const mount of this.pendingMounts.splice(0)) mount();
   }
@@ -1038,7 +1065,7 @@ export class SettingsUI {
       ),
     );
     view.appendChild(
-      note('Drag the model on the stage to move it. Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model’s size.'),
+      help('Drag the model on the stage to move it. Render scale is the drawing resolution (lower is faster, higher is sharper); zoom is the model’s size.'),
     );
     host.appendChild(section('View', [view]));
 
@@ -1137,7 +1164,7 @@ export class SettingsUI {
       ),
     );
     animations.appendChild(
-      note(
+      help(
         'Chat-open, click and emotion animations play once, then the idle loop resumes. ' +
           'The talking animation plays on a layer above them. The click message, if any, is posted to the chat.',
       ),
@@ -1180,7 +1207,7 @@ export class SettingsUI {
     }
     classify.appendChild(grid);
     classify.appendChild(
-      note(
+      help(
         'A new character message plays the animation mapped to its emotion. Dimmed rows play nothing. ' +
           'Emotions whose names match one of the model’s animations are mapped on first load.',
       ),
@@ -1218,6 +1245,7 @@ export const UI_CSS = `
 .spn-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
 .spn-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .spn-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.spn-hide-help .spn-help, .spn-hide-help .spn-hint { display: none; }
 .spn-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
 .spn-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
 .spn-slider { margin: 6px 0 2px; }
