@@ -32,11 +32,19 @@ const STAGE_CSS = `
 .spine-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
 html.spine-avatars-tap, html.spine-avatars-tap * { cursor: pointer !important; }
+.spine-avatars-bar-button { display: flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 26px; padding: 0; border: none; border-radius: var(--lcs-radius-xs, 6px); background: transparent; color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4)); cursor: pointer; transition: color 120ms ease, background 120ms ease; }
+.spine-avatars-bar-button:hover { color: var(--lumiverse-text, rgba(230, 230, 240, 0.92)); background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06)); }
+.spine-avatars-bar-button svg { width: 16px; height: 16px; }
 `;
 
 // A jointed figure: bones and joints, the way a Spine rig is built.
 const TAB_ICON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2"/><path d="M12 6.5v6.5"/><path d="M12 8.5l-4 2.5-1.5 3.5M12 8.5l4 2.5 1.5 3.5"/><path d="M12 13l-3 3.5L8 21M12 13l3 3.5 1 4.5"/><circle cx="12" cy="13" r=".8"/><circle cx="8" cy="11" r=".8"/><circle cx="16" cy="11" r=".8"/><circle cx="9" cy="16.5" r=".8"/><circle cx="15" cy="16.5" r=".8"/></svg>';
+
+// The chat menu bar's reload button: a refresh arrow around a small jointed figure, so it doesn't look
+// like Lumiverse's own Regenerate.
+const RELOAD_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M18.6 2.5v4h-4"/><circle cx="12" cy="9" r="1.3"/><path d="M12 10.4v3.4M12 11.6l-2.6 1.6M12 11.6l2.6 1.6M12 13.8l-1.8 3M12 13.8l1.8 3"/></svg>';
 
 function downloadJson(fileName: string, value: unknown): void {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }));
@@ -204,6 +212,24 @@ export function setup(ctx: SpindleFrontendContext) {
   // ── Settings tab ──────────────────────────────────────────────────────────
   let classifyPending: { resolve: (label: string) => void; reject: (error: Error) => void } | null = null;
 
+  // ── Reload button in the chat's menu bar ──
+  // Lumiverse's chat_actions mount sits in the row of icons above the message input.
+  const chatBar = ctx.ui.mount('chat_actions') as HTMLElement;
+  chatBar.style.display = 'contents';
+  const chatBarButton = document.createElement('button');
+  chatBarButton.type = 'button';
+  chatBarButton.className = 'spine-avatars-bar-button';
+  chatBarButton.title = 'Reload Spine models';
+  chatBarButton.setAttribute('aria-label', 'Reload Spine models');
+  chatBarButton.innerHTML = RELOAD_ICON;
+  chatBarButton.addEventListener('click', () => controller.reloadStage());
+  const syncChatBarButton = () => {
+    const show = settings.global.enabled && settings.global.showReloadButton;
+    if (show && chatBarButton.parentElement !== chatBar) chatBar.replaceChildren(chatBarButton);
+    else if (!show && chatBarButton.parentElement) chatBarButton.remove();
+  };
+  cleanups.push(() => chatBarButton.remove());
+
   const controller: UIController = {
     getSettings: () => settings,
     getModels: () => models,
@@ -217,6 +243,7 @@ export function setup(ctx: SpindleFrontendContext) {
       applyBackgroundMode();
       void stage.reload();
     },
+    syncChatBarButton: () => syncChatBarButton(),
     importZip: async (status) => {
       const files = await ctx.uploads.pickFile({
         accept: ['.zip', 'application/zip'],

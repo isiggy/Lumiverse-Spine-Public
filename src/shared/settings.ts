@@ -140,6 +140,10 @@ export interface GlobalSettings {
   /** Model library order and layout in the settings tab. */
   librarySort: LibrarySort;
   libraryView: LibraryView;
+  /** Show the explanations under the settings in the settings tab. */
+  showHelp: boolean;
+  /** Show a button that reloads the models in the chat's menu bar. */
+  showReloadButton: boolean;
 }
 
 export type LibrarySort = 'name' | 'name_desc' | 'newest' | 'oldest' | 'largest' | 'smallest';
@@ -203,6 +207,8 @@ export function defaultGlobalSettings(): GlobalSettings {
     expressionSource: 'llm',
     librarySort: 'name',
     libraryView: 'tiles',
+    showHelp: true,
+    showReloadButton: true,
   };
 }
 
