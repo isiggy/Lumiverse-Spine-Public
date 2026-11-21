@@ -821,10 +821,11 @@ async function runGroup() {
   await selectCharacter(members[0]);
   await waitForModelSettings();
   const draggedX = await sliderValue('X offset');
-  const expectedX = (80 / (columnWidth / 2)) * 100;
+  // X offset 100 is the stage's right edge, measured from the column's middle.
+  const expectedX = (80 / (columnWidth * members.length - columnWidth / 2)) * 100;
   check(
-    Math.abs(draggedX - expectedX) < 2,
-    `member 1's X offset is relative to its column: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
+    Math.abs(draggedX - expectedX) < 1,
+    `member 1's X offset runs from its column's middle to the stage's edge: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
   );
   await clickButton('Fit to canvas');
 

@@ -39,9 +39,10 @@ import {
   LONG_PRESS_MS,
   type MenuItem,
   SharedColumns,
-  arrangeColumns,
   avatarLayer,
   modelMenu,
+  offsetForStageX,
+  stageX,
   releaseAvatarLayers,
   sameColumns,
   sameStack,
@@ -543,12 +544,7 @@ export class Stage {
     const own = [...this.boundCharacters(settings).keys()];
     const overApp = this.host !== null && this.deps.layer() !== null;
     this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
-    const order = this.sharedColumns.shareOrder(settings.columnOrder);
-    if (order.at > settings.columnOrder.at) {
-      settings.columnOrder = { characterIds: [...order.characterIds], at: order.at };
-      this.deps.saveSettingsDebounced();
-    }
-    const columns = this.sharedColumns.layout(this.characterIds, own, overApp, settings.columnOrder.characterIds);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
     const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
     if (sameColumns(columns, this.columns) && sameStack(stack, this.stack)) return;
     this.columns = columns;
@@ -571,27 +567,6 @@ export class Stage {
     const settings = this.deps.getSettings();
     if (layer === 0) delete settings.characterLayers[characterId];
     else settings.characterLayers[characterId] = layer;
-    this.deps.saveSettingsDebounced();
-    this.updateColumns();
-    return true;
-  }
-
-  /**
-   * Move a character's model to another column of the chat (counted from the
-   * left, Spine or Live2D), shifting the models between over by one. False
-   * when it isn't in a column, or is already in that one.
-   */
-  moveToColumn(characterId: string, column: number): boolean {
-    this.updateColumns();
-    const index = this.columns.index;
-    const current = index.get(characterId);
-    const target = Math.min(index.size - 1, Math.max(0, column));
-    if (current === undefined || current === target) return false;
-    const arrangement = [...index.keys()].sort((a, b) => index.get(a)! - index.get(b)!);
-    arrangement.splice(current, 1);
-    arrangement.splice(target, 0, characterId);
-    const settings = this.deps.getSettings();
-    settings.columnOrder = arrangeColumns(settings.columnOrder, arrangement);
     this.deps.saveSettingsDebounced();
     this.updateColumns();
     return true;
@@ -1098,7 +1073,7 @@ export class Stage {
     const sin = Math.sin(angle);
     const centerX = bounds.x + bounds.width / 2;
     const centerY = bounds.y + bounds.height / 2;
-    const targetX = left + width / 2 + ((width / 2) * settings.x) / 100;
+    const targetX = stageX(stageWidth, left + width / 2, settings.x);
     const targetY = height / 2 + ((height / 2) * settings.y) / 100;
     // Skeleton space is y-up and the screen is y-down; rotation is clockwise on screen.
     const a = scale * cos;
@@ -1297,7 +1272,7 @@ export class Stage {
     const settings = this.settingsFor(entry);
     const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     return {
-      x: slot.x + slot.width / 2 + ((slot.width / 2) * settings.x) / 100,
+      x: stageX(this.hostWidth, slot.x + slot.width / 2, settings.x),
       y: slot.height / 2 + ((slot.height / 2) * settings.y) / 100,
     };
   }
@@ -1362,7 +1337,7 @@ export class Stage {
 
   /**
    * Show the menu of a model that shares the stage with others (Send to front
-   * / back, Move left / right) and do what's picked. False when it's alone.
+   * / Send to back) and do what's picked. False when it's alone.
    */
   private openModelMenu(entry: LoadedEntry, clientX: number, clientY: number): boolean {
     this.updateColumns();
@@ -1371,10 +1346,7 @@ export class Stage {
     void this.deps.showContextMenu(clientX, clientY, items).then((key) => {
       const { characterId } = entry;
       if (!key || !this.entryFor(characterId)) return;
-      const column = this.columns.index.get(characterId) ?? 0;
       if (key === 'front' || key === 'back') this.restack(characterId, key === 'front');
-      else if (key === 'left' || key === 'right') this.moveToColumn(characterId, column + (key === 'left' ? -1 : 1));
-      this.deps.layoutChanged();
     });
     return true;
   }
@@ -1418,17 +1390,14 @@ export class Stage {
     if (!drag.moved && Math.abs(newX - center.x) < 3 && Math.abs(newY - center.y) < 3) return;
     drag.moved = true;
     this.cancelLongPress();
-    // Dragged over another column, the model moves into it and the models
-    // between shift over, so it stays where it's dropped.
-    if (this.columns.count > 1) {
-      this.moveToColumn(entry.characterId, Math.floor(newX / (this.hostWidth / this.columns.count)));
-    }
-    // Persist as percent offsets of the model's center from its column's center.
+    // Persist as percent offsets of the model's center: X from its column's
+    // center toward the stage's edge (stageX), so a group chat's models can go
+    // anywhere on the stage; Y of half the stage's height.
     const settings = this.settingsFor(entry);
     const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const { min, max } = SETTINGS_LIMITS.offset;
     const percent = (value: number) => Math.min(max, Math.max(min, Math.round(value * 100) / 100));
-    settings.x = percent(((newX - slot.x - slot.width / 2) / (slot.width / 2)) * 100);
+    settings.x = percent(offsetForStageX(this.hostWidth, slot.x + slot.width / 2, newX));
     settings.y = percent(((newY - slot.height / 2) / (slot.height / 2)) * 100);
     this.deps.saveSettingsDebounced();
     this.deps.layoutChanged();

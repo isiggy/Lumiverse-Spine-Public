@@ -625,11 +625,11 @@ export class SettingsUI {
       if (isGroup) {
         bindingSection.appendChild(
           help(
-            'Group chat: every member with a model is shown, side by side in equal columns ' +
-              '(Spine and, with the Live2D Avatars extension, Live2D models). ' +
-              'Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, ' +
-              'and X and Y offset and Fit to canvas work within that column. Right-click a model (or touch and hold it) ' +
-              'to send it to the front or back where models overlap, or to move it left or right.',
+            'Group chat: every member with a model is shown, starting side by side in equal columns in member order ' +
+              '(Spine and, with the Live2D Avatars extension, Live2D models). Drag a model anywhere on the screen. ' +
+              'Zoom 1 fits the model in its column and Fit to canvas puts it back there; X offset 0 is the middle of its ' +
+              'column, -100 and 100 the left and right edges of the screen. Right-click a model (or touch and hold it) ' +
+              'to send it to the front or back where models overlap.',
           ),
         );
       }

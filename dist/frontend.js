@@ -456,20 +456,6 @@ var CHANGED_EVENT = "lumiverse-avatar-columns-changed";
 var OWNER_ATTRIBUTE = "data-lumiverse-avatar";
 var RANK_ATTRIBUTE = "data-lumiverse-avatar-rank";
 var LAYER_ATTRIBUTE = "data-lumiverse-avatar-layer";
-var MAX_ORDER = 1000;
-function arrangeColumns(order, arrangement) {
-  const moved = new Set(arrangement);
-  const first = order.characterIds.findIndex((id) => moved.has(id));
-  const rest = order.characterIds.filter((id) => !moved.has(id));
-  rest.splice(first === -1 ? rest.length : first, 0, ...moved);
-  while (rest.length > MAX_ORDER) {
-    const index = rest.findLastIndex((id) => !moved.has(id));
-    if (index === -1)
-      break;
-    rest.splice(index, 1);
-  }
-  return { characterIds: rest, at: Math.max(Date.now(), order.at + 1) };
-}
 function registry() {
   const scope = window;
   const existing = scope[REGISTRY_KEY];
@@ -479,6 +465,14 @@ function registry() {
   const fresh = { version: 1, extensions: {} };
   scope[REGISTRY_KEY] = fresh;
   return fresh;
+}
+function stageX(stageWidth, columnCenter, offset) {
+  return columnCenter + offset / 100 * (offset < 0 ? columnCenter : stageWidth - columnCenter);
+}
+function offsetForStageX(stageWidth, columnCenter, x) {
+  const delta = x - columnCenter;
+  const room = delta < 0 ? columnCenter : stageWidth - columnCenter;
+  return room > 0 ? Math.min(100, Math.max(-100, delta / room * 100)) : 0;
 }
 function sameColumns(a, b) {
   if (a.count !== b.count || a.index.size !== b.index.size)
@@ -526,15 +520,7 @@ class SharedColumns {
     shared.layers = { ...shared.layers, [this.extensionId]: ownLayers };
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
-  shareOrder(order) {
-    const shared = registry();
-    if (shared.order && shared.order.at >= order.at)
-      return shared.order;
-    shared.order = { characterIds: [...order.characterIds], at: order.at };
-    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
-    return shared.order;
-  }
-  layout(members, own, shared, order = []) {
+  layout(members, own, shared) {
     const withModel = new Set(own);
     if (shared) {
       for (const [extension, characterIds] of Object.entries(registry().extensions)) {
@@ -544,11 +530,8 @@ class SharedColumns {
           withModel.add(characterId);
       }
     }
-    const position = new Map(order.map((characterId, index) => [characterId, index]));
-    const placed = members.filter((characterId) => position.has(characterId));
-    placed.sort((a, b) => position.get(a) - position.get(b));
     const index = new Map;
-    for (const characterId of [...placed, ...members.filter((characterId) => !position.has(characterId))]) {
+    for (const characterId of members) {
       if (withModel.has(characterId) && !index.has(characterId))
         index.set(characterId, index.size);
     }
@@ -649,15 +632,11 @@ class SharedColumns {
 }
 function modelMenu(stack, columns, extension, characterId) {
   const rank = stack.findIndex((item) => item.extension === extension && item.characterId === characterId);
-  const column = columns.index.get(characterId);
-  if (rank === -1 || column === undefined || stack.length < 2)
+  if (rank === -1 || !columns.index.has(characterId) || stack.length < 2)
     return null;
   const items = [
     { key: "front", label: "Send to front", disabled: rank === stack.length - 1 },
-    { key: "back", label: "Send to back", disabled: rank === 0 },
-    { key: "divider", label: "", type: "divider" },
-    { key: "left", label: "Move left", disabled: column === 0 },
-    { key: "right", label: "Move right", disabled: column >= columns.count - 1 }
+    { key: "back", label: "Send to back", disabled: rank === 0 }
   ];
   return items;
 }
@@ -23688,8 +23667,7 @@ function defaultSettings() {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
     characterModelsSettings: {},
-    characterLayers: {},
-    columnOrder: { characterIds: [], at: 0 }
+    characterLayers: {}
   };
 }
 function findAnimation(names, hints) {
@@ -23758,14 +23736,6 @@ function normalizeSettings(raw) {
       if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
         base.characterLayers[characterId] = layer;
     }
-  }
-  const order = value.columnOrder;
-  if (order && typeof order === "object" && Array.isArray(order.characterIds)) {
-    const ids = order.characterIds.filter((id) => typeof id === "string" && id !== "");
-    base.columnOrder = {
-      characterIds: [...new Set(ids)],
-      at: typeof order.at === "number" && Number.isFinite(order.at) ? order.at : 0
-    };
   }
   return base;
 }
@@ -24277,12 +24247,7 @@ class Stage {
     const own = [...this.boundCharacters(settings).keys()];
     const overApp = this.host !== null && this.deps.layer() !== null;
     this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
-    const order = this.sharedColumns.shareOrder(settings.columnOrder);
-    if (order.at > settings.columnOrder.at) {
-      settings.columnOrder = { characterIds: [...order.characterIds], at: order.at };
-      this.deps.saveSettingsDebounced();
-    }
-    const columns = this.sharedColumns.layout(this.characterIds, own, overApp, settings.columnOrder.characterIds);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
     const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
     if (sameColumns(columns, this.columns) && sameStack(stack, this.stack))
       return;
@@ -24304,22 +24269,6 @@ class Stage {
       delete settings.characterLayers[characterId];
     else
       settings.characterLayers[characterId] = layer;
-    this.deps.saveSettingsDebounced();
-    this.updateColumns();
-    return true;
-  }
-  moveToColumn(characterId, column) {
-    this.updateColumns();
-    const index = this.columns.index;
-    const current = index.get(characterId);
-    const target = Math.min(index.size - 1, Math.max(0, column));
-    if (current === undefined || current === target)
-      return false;
-    const arrangement = [...index.keys()].sort((a, b) => index.get(a) - index.get(b));
-    arrangement.splice(current, 1);
-    arrangement.splice(target, 0, characterId);
-    const settings = this.deps.getSettings();
-    settings.columnOrder = arrangeColumns(settings.columnOrder, arrangement);
     this.deps.saveSettingsDebounced();
     this.updateColumns();
     return true;
@@ -24741,7 +24690,7 @@ class Stage {
     const sin = Math.sin(angle);
     const centerX = bounds.x + bounds.width / 2;
     const centerY = bounds.y + bounds.height / 2;
-    const targetX = left + width / 2 + width / 2 * settings.x / 100;
+    const targetX = stageX(stageWidth, left + width / 2, settings.x);
     const targetY = height / 2 + height / 2 * settings.y / 100;
     const a = scale * cos;
     const c = scale * sin;
@@ -24906,7 +24855,7 @@ class Stage {
     const settings = this.settingsFor(entry);
     const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     return {
-      x: slot.x + slot.width / 2 + slot.width / 2 * settings.x / 100,
+      x: stageX(this.hostWidth, slot.x + slot.width / 2, settings.x),
       y: slot.height / 2 + slot.height / 2 * settings.y / 100
     };
   }
@@ -24977,12 +24926,8 @@ class Stage {
       const { characterId } = entry;
       if (!key || !this.entryFor(characterId))
         return;
-      const column = this.columns.index.get(characterId) ?? 0;
       if (key === "front" || key === "back")
         this.restack(characterId, key === "front");
-      else if (key === "left" || key === "right")
-        this.moveToColumn(characterId, column + (key === "left" ? -1 : 1));
-      this.deps.layoutChanged();
     });
     return true;
   }
@@ -25025,14 +24970,11 @@ class Stage {
       return;
     drag.moved = true;
     this.cancelLongPress();
-    if (this.columns.count > 1) {
-      this.moveToColumn(entry.characterId, Math.floor(newX / (this.hostWidth / this.columns.count)));
-    }
     const settings = this.settingsFor(entry);
     const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
     const { min, max } = SETTINGS_LIMITS.offset;
     const percent = (value) => Math.min(max, Math.max(min, Math.round(value * 100) / 100));
-    settings.x = percent((newX - slot.x - slot.width / 2) / (slot.width / 2) * 100);
+    settings.x = percent(offsetForStageX(this.hostWidth, slot.x + slot.width / 2, newX));
     settings.y = percent((newY - slot.height / 2) / (slot.height / 2) * 100);
     this.deps.saveSettingsDebounced();
     this.deps.layoutChanged();
@@ -25564,7 +25506,7 @@ class SettingsUI {
         bindingSection.appendChild(note("Your library is empty: import a model in Model library below first."));
       }
       if (isGroup) {
-        bindingSection.appendChild(help("Group chat: every member with a model is shown, side by side in equal columns " + "(Spine and, with the Live2D Avatars extension, Live2D models). " + "Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Right-click a model (or touch and hold it) " + "to send it to the front or back where models overlap, or to move it left or right."));
+        bindingSection.appendChild(help("Group chat: every member with a model is shown, starting side by side in equal columns in member order " + "(Spine and, with the Live2D Avatars extension, Live2D models). Drag a model anywhere on the screen. " + "Zoom 1 fits the model in its column and Fit to canvas puts it back there; X offset 0 is the middle of its " + "column, -100 and 100 the left and right edges of the screen. Right-click a model (or touch and hold it) " + "to send it to the front or back where models overlap."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "spn-dim", this.fileStatusText);
