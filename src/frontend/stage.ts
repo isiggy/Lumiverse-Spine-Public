@@ -36,8 +36,12 @@ import {
   type Columns,
   type LayerKind,
   type Stacked,
+  LONG_PRESS_MS,
+  type MenuItem,
   SharedColumns,
+  arrangeColumns,
   avatarLayer,
+  modelMenu,
   releaseAvatarLayers,
   sameColumns,
   sameStack,
@@ -107,6 +111,8 @@ export interface StageDeps {
   layer(): LayerKind | null;
   /** The stage changed the model's position or zoom itself (a drag). */
   layoutChanged(): void;
+  /** Show the app's context menu at a viewport point; resolves to the chosen item's key, or null. */
+  showContextMenu(x: number, y: number, items: MenuItem[]): Promise<string | null>;
   assets: ModelAssets;
   /** Send a click interaction message into the chat, from a click on this character's model. */
   sendInteraction(message: string, characterId: string): void;
@@ -412,8 +418,16 @@ export class Stage {
   private resizeObserver: ResizeObserver | null = null;
   private previousInteraction = { characterId: '', message: '' };
   private descriptionCache = new Map<string, ModelDescription>();
-  private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
-    null;
+  /** A press on a model: a drag once it moves; `menu` once a long touch opened the model menu instead. */
+  private drag: {
+    entry: LoadedEntry;
+    pointerId: number;
+    offsetX: number;
+    offsetY: number;
+    moved: boolean;
+    menu: boolean;
+  } | null = null;
+  private longPress: number | null = null;
   private suppressClick = false;
   /**
    * A press on a background model through the chat (see SharedColumns.topmostAt):
@@ -433,6 +447,7 @@ export class Stage {
     [document, 'pointercancel', () => this.endDrag(), { capture: true }],
     [document, 'scroll', () => (this.pendingTap = null), { capture: true, passive: true }],
     [document, 'click', (event) => this.onClickCapture(event as MouseEvent), { capture: true }],
+    [document, 'contextmenu', (event) => this.onContextMenu(event as MouseEvent), { capture: true }],
     [document, 'touchstart', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
     [document, 'touchmove', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
   ];
@@ -528,7 +543,12 @@ export class Stage {
     const own = [...this.boundCharacters(settings).keys()];
     const overApp = this.host !== null && this.deps.layer() !== null;
     this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
-    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    const order = this.sharedColumns.shareOrder(settings.columnOrder);
+    if (order.at > settings.columnOrder.at) {
+      settings.columnOrder = { characterIds: [...order.characterIds], at: order.at };
+      this.deps.saveSettingsDebounced();
+    }
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp, settings.columnOrder.characterIds);
     const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
     if (sameColumns(columns, this.columns) && sameStack(stack, this.stack)) return;
     this.columns = columns;
@@ -551,6 +571,27 @@ export class Stage {
     const settings = this.deps.getSettings();
     if (layer === 0) delete settings.characterLayers[characterId];
     else settings.characterLayers[characterId] = layer;
+    this.deps.saveSettingsDebounced();
+    this.updateColumns();
+    return true;
+  }
+
+  /**
+   * Move a character's model to another column of the chat (counted from the
+   * left, Spine or Live2D), shifting the models between over by one. False
+   * when it isn't in a column, or is already in that one.
+   */
+  moveToColumn(characterId: string, column: number): boolean {
+    this.updateColumns();
+    const index = this.columns.index;
+    const current = index.get(characterId);
+    const target = Math.min(index.size - 1, Math.max(0, column));
+    if (current === undefined || current === target) return false;
+    const arrangement = [...index.keys()].sort((a, b) => index.get(a)! - index.get(b)!);
+    arrangement.splice(current, 1);
+    arrangement.splice(target, 0, characterId);
+    const settings = this.deps.getSettings();
+    settings.columnOrder = arrangeColumns(settings.columnOrder, arrangement);
     this.deps.saveSettingsDebounced();
     this.updateColumns();
     return true;
@@ -1201,7 +1242,7 @@ export class Stage {
    * overlap, the one drawn on top wins. `through`: a background model under
    * an empty part of the chat, which can be tapped but not dragged.
    */
-  private modelAt(event: PointerEvent): { entry: LoadedEntry; through: boolean } | null {
+  private modelAt(event: MouseEvent): { entry: LoadedEntry; through: boolean } | null {
     if (this.loaded.length === 0 || !this.gl) return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR)) return null;
@@ -1275,14 +1316,67 @@ export class Stage {
     event.stopPropagation();
     const point = this.toStagePoint(event);
     const center = this.modelCenter(entry);
-    this.drag = {
+    const drag = {
       entry,
       pointerId: event.pointerId,
       offsetX: point.x - center.x,
       offsetY: point.y - center.y,
       moved: false,
+      menu: false,
     };
+    this.drag = drag;
     this.suppressClick = true;
+    if (event.pointerType !== 'mouse') {
+      // Touch has no right-click: holding still on a model opens its menu.
+      const { clientX, clientY } = event;
+      this.cancelLongPress();
+      this.longPress = window.setTimeout(() => {
+        this.longPress = null;
+        if (this.drag !== drag || drag.moved || !this.loaded.includes(entry)) return;
+        if (this.openModelMenu(entry, clientX, clientY)) drag.menu = true;
+      }, LONG_PRESS_MS);
+    }
+  }
+
+  private cancelLongPress(): void {
+    if (this.longPress !== null) window.clearTimeout(this.longPress);
+    this.longPress = null;
+  }
+
+  /** A right-click on a model sharing the stage opens its menu instead of the browser's. */
+  private onContextMenu(event: MouseEvent): void {
+    // A touch held on a model: its long press opens the menu (see onPointerDown).
+    if (this.drag) {
+      event.preventDefault();
+      return;
+    }
+    const hit = this.modelAt(event);
+    if (!hit) return;
+    // Through the chat, leave a right-click over selected text to the chat.
+    const selection = window.getSelection();
+    if (hit.through && selection && !selection.isCollapsed) return;
+    if (!this.openModelMenu(hit.entry, event.clientX, event.clientY)) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  /**
+   * Show the menu of a model that shares the stage with others (Send to front
+   * / back, Move left / right) and do what's picked. False when it's alone.
+   */
+  private openModelMenu(entry: LoadedEntry, clientX: number, clientY: number): boolean {
+    this.updateColumns();
+    const items = modelMenu(this.stack, this.columns, EXTENSION_ID, entry.characterId);
+    if (!items) return false;
+    void this.deps.showContextMenu(clientX, clientY, items).then((key) => {
+      const { characterId } = entry;
+      if (!key || !this.entryFor(characterId)) return;
+      const column = this.columns.index.get(characterId) ?? 0;
+      if (key === 'front' || key === 'back') this.restack(characterId, key === 'front');
+      else if (key === 'left' || key === 'right') this.moveToColumn(characterId, column + (key === 'left' ? -1 : 1));
+      this.deps.layoutChanged();
+    });
+    return true;
   }
 
   private onPointerMove(event: PointerEvent): void {
@@ -1316,13 +1410,19 @@ export class Stage {
 
   private dragTo(drag: NonNullable<Stage['drag']>, event: PointerEvent): void {
     const { entry } = drag;
-    if (!this.loaded.includes(entry) || this.hostWidth === 0 || this.hostHeight === 0) return;
+    if (drag.menu || !this.loaded.includes(entry) || this.hostWidth === 0 || this.hostHeight === 0) return;
     const point = this.toStagePoint(event);
     const center = this.modelCenter(entry);
     const newX = point.x - drag.offsetX;
     const newY = point.y - drag.offsetY;
     if (!drag.moved && Math.abs(newX - center.x) < 3 && Math.abs(newY - center.y) < 3) return;
     drag.moved = true;
+    this.cancelLongPress();
+    // Dragged over another column, the model moves into it and the models
+    // between shift over, so it stays where it's dropped.
+    if (this.columns.count > 1) {
+      this.moveToColumn(entry.characterId, Math.floor(newX / (this.hostWidth / this.columns.count)));
+    }
     // Persist as percent offsets of the model's center from its column's center.
     const settings = this.settingsFor(entry);
     const slot = this.slotOf(entry, this.hostWidth, this.hostHeight);
@@ -1354,10 +1454,11 @@ export class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded.includes(drag.entry)) this.onModelClick(drag.entry);
+    if (!drag.moved && !drag.menu && this.loaded.includes(drag.entry)) this.onModelClick(drag.entry);
   }
 
   private endDrag(): void {
+    this.cancelLongPress();
     this.drag = null;
     this.pendingTap = null;
     // The browser dispatches `click` right after `pointerup`; if the pointer was
@@ -1416,6 +1517,7 @@ export class Stage {
     // so don't leave the next click anywhere swallowed.
     if (this.drag) this.suppressClick = false;
     this.drag = null;
+    this.cancelLongPress();
     this.pendingTap = null;
     this.setHovering(false);
     this.resizeObserver?.disconnect();

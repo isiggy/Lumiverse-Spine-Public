@@ -105,6 +105,8 @@ export function setup(ctx: SpindleFrontendContext) {
     saveSettingsDebounced: saveDebounced,
     layer: () => (overlayActive ? (backgroundModeOn() ? 'background' : 'front') : null),
     layoutChanged: () => ui.layoutChanged(),
+    showContextMenu: async (x, y, items) =>
+      (await ctx.ui.showContextMenu({ position: { x, y }, items })).selectedKey ?? null,
     assets,
     sendInteraction: (message, characterId) => {
       const { chatId } = stage.getChatContext();
