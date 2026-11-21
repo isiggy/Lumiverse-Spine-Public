@@ -9,6 +9,7 @@ A Spindle extension for Lumiverse that shows Spine models as character avatars. 
 - `src/frontend.ts`: browser entry. Wires the stage, settings tab and backend messages together.
 - `src/frontend/stage.ts`: spine-webgl rendering, layout and model interaction. `ui.ts` is the settings tab, `assets.ts` the model file cache, `tus.ts` the upload client, `thumbnail.ts` turns a stage capture into a library thumbnail.
 - `src/shared/`: the settings schema, the frontend/backend message types, and `settings-file.ts`, the export/import file format (shared with the Live2D extension; keep the two copies in step).
+- Settings tab building blocks (`ui.ts`, same in both repos): `section()` is a `<details>` whose open/closed state is remembered per title in localStorage; `field()` lines a label up with its control(s); `slider()` has a typed number next to it and a ↺ reset to the default, and its range input carries the label as `aria-label`, which is how e2e finds sliders. A checkbox's optional hint sits inside its `<label>`, so e2e matches the label's first span, not its whole text. Order: Global, Character model, Model settings, Model library, Test emotion classification, Debug.
 - The Character model dropdowns are Lumiverse's own searchable select (`ctx.components.mountSelect`), mounted after each render into placeholders and destroyed on the next; e2e drives them by clicking the trigger and the `[role="option"]` rows.
 - `dist/` is committed, because Lumiverse installs straight from the repo. Rebuild before committing source changes.
 

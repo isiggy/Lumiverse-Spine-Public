@@ -234,6 +234,10 @@ export function setup(ctx: SpindleFrontendContext) {
         status(`Upload failed: ${String(error)}`);
       }
     },
+    confirm: async ({ title, message, confirmLabel }) => {
+      const { confirmed } = await ctx.ui.showConfirm({ title, message, variant: 'danger', confirmLabel });
+      return confirmed;
+    },
     deleteModel: async (modelId) => {
       const record = models.find((model) => model.id === modelId);
       const { confirmed } = await ctx.ui.showConfirm({
