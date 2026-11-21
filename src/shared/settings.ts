@@ -161,6 +161,12 @@ export interface SpineSettings {
    * layer 0.
    */
   characterLayers: Record<string, number>;
+  /**
+   * The left-to-right order the user arranged group chat members' models in,
+   * by dragging one into another column. Shared with the sibling avatar
+   * extension, newest wins; see ColumnOrder in frontend/columns.ts.
+   */
+  columnOrder: { characterIds: string[]; at: number };
 }
 
 export interface ModelRecord {
@@ -218,6 +224,7 @@ export function defaultSettings(): SpineSettings {
     characterModelMapping: {},
     characterModelsSettings: {},
     characterLayers: {},
+    columnOrder: { characterIds: [], at: 0 },
   };
 }
 
@@ -288,6 +295,14 @@ export function normalizeSettings(raw: unknown): SpineSettings {
     for (const [characterId, layer] of Object.entries(value.characterLayers)) {
       if (typeof layer === 'number' && Number.isFinite(layer) && layer !== 0) base.characterLayers[characterId] = layer;
     }
+  }
+  const order = value.columnOrder as Partial<{ characterIds: unknown; at: unknown }> | undefined;
+  if (order && typeof order === 'object' && Array.isArray(order.characterIds)) {
+    const ids = order.characterIds.filter((id): id is string => typeof id === 'string' && id !== '');
+    base.columnOrder = {
+      characterIds: [...new Set(ids)],
+      at: typeof order.at === 'number' && Number.isFinite(order.at) ? order.at : 0,
+    };
   }
   return base;
 }

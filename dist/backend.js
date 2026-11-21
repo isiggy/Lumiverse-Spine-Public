@@ -2243,7 +2243,8 @@ function defaultSettings() {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
     characterModelsSettings: {},
-    characterLayers: {}
+    characterLayers: {},
+    columnOrder: { characterIds: [], at: 0 }
   };
 }
 function findAnimation(names, hints) {
@@ -2312,6 +2313,14 @@ function normalizeSettings(raw) {
       if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
         base.characterLayers[characterId] = layer;
     }
+  }
+  const order = value.columnOrder;
+  if (order && typeof order === "object" && Array.isArray(order.characterIds)) {
+    const ids = order.characterIds.filter((id) => typeof id === "string" && id !== "");
+    base.columnOrder = {
+      characterIds: [...new Set(ids)],
+      at: typeof order.at === "number" && Number.isFinite(order.at) ? order.at : 0
+    };
   }
   return base;
 }
