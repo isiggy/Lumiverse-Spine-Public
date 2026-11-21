@@ -2778,7 +2778,7 @@ function sampleClassifyText(text) {
   }
   return result.trim();
 }
-async function classifyExpression(text) {
+async function classifyExpression(text, userId) {
   if (!text.trim())
     return { error: "Nothing to classify." };
   if (!spindle.permissions.has("generation"))
@@ -2787,6 +2787,7 @@ async function classifyExpression(text) {
   try {
     const result = await spindle.generate.quiet({
       type: "quiet",
+      ...userId ? { userId } : {},
       messages: [
         {
           role: "system",
@@ -2844,7 +2845,7 @@ async function handleCharacterMessage(chatId, message, userId) {
     return;
   if (!text)
     return;
-  const result = await classifyExpression(text);
+  const result = await classifyExpression(text, userId);
   if (!("label" in result))
     return;
   send({ type: "expression", chatId, characterId, label: result.label, source: "llm" }, userId);
@@ -2912,7 +2913,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         await sendChatContext(msg.chatId, userId);
         break;
       case "classify_test": {
-        const result = await classifyExpression(msg.text);
+        const result = await classifyExpression(msg.text, userId);
         send("label" in result ? { type: "classify_test_result", label: result.label } : { type: "classify_test_result", label: "", error: result.error }, userId);
         break;
       }
