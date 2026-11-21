@@ -17,6 +17,10 @@
  * extensions put their canvases in the same shared layer element, sorted by
  * that order, so a Live2D model can sit between two Spine models. A click goes
  * to the topmost model under the pointer, whichever extension draws it.
+ *
+ * As the chat background, the models sit under the chat. A tap still reaches
+ * one where the chat draws nothing over it: the empty space between and
+ * around messages (see seeThroughAt).
  */
 
 const REGISTRY_KEY = '__lumiverseAvatarColumns';
@@ -223,10 +227,13 @@ export class SharedColumns {
   /**
    * The model a pointer at this viewport point is on, from any extension: the
    * topmost avatar canvas there whose model covers the point. Null when
-   * something else of the app is above the models there (a drawer, a modal, the
-   * chat over a background model) or no model is under the point.
+   * something else of the app is above the models there (a drawer, a modal, a
+   * message or the input over a background model) or no model is under the
+   * point. `through` says the chat is above a background model there but
+   * draws nothing at the point (see seeThroughAt): a tap can reach the model,
+   * but a press there must stay the chat's, to scroll or select text.
    */
-  topmostAt(clientX: number, clientY: number): { extension: string; characterId: string } | null {
+  topmostAt(clientX: number, clientY: number): { extension: string; characterId: string; through: boolean } | null {
     const canvases = [...document.querySelectorAll<HTMLElement>(`[${OWNER_ATTRIBUTE}]`)];
     const previous = canvases.map((canvas) => canvas.style.pointerEvents);
     for (const canvas of canvases) canvas.style.pointerEvents = 'auto';
@@ -237,11 +244,22 @@ export class SharedColumns {
       canvases.forEach((canvas, index) => (canvas.style.pointerEvents = previous[index]!));
     }
     const hitTests = registry().hitTests ?? {};
+    const background = findLayer('background');
+    const behindChat = !!background?.querySelector(`[${OWNER_ATTRIBUTE}]`);
+    let through = false;
     for (const element of elements) {
       const extension = element.getAttribute(OWNER_ATTRIBUTE);
-      if (!extension) return null;
+      if (!extension) {
+        if (behindChat && seeThroughAt(element, clientX, clientY)) {
+          through = true;
+          continue;
+        }
+        return null;
+      }
+      // Past the chat, only the background models are under the point.
+      if (through && element.parentElement !== background) continue;
       const characterId = hitTests[extension]?.(element, clientX, clientY) ?? null;
-      if (characterId) return { extension, characterId };
+      if (characterId) return { extension, characterId, through };
     }
     return null;
   }
@@ -255,6 +273,85 @@ export class SharedColumns {
     delete shared.extensions[this.extensionId];
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
+}
+
+// ── Tapping through the chat ─────────────────────────────────────────────────
+
+/** Elements that take their own clicks. */
+const INTERACTIVE_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  'button',
+  'a[href]',
+  'label',
+  'summary',
+  'img',
+  'video',
+  'audio',
+  'canvas',
+  'svg',
+  'iframe',
+  'object',
+  'embed',
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="textbox"]',
+  '[role="menuitem"]',
+  '[role="tab"]',
+  '[role="slider"]',
+  '[role="dialog"]',
+].join(',');
+
+/** Classes the extensions put on <html> to set the cursor everywhere while it's over a model. */
+const OWN_CURSORS = '.live2d-avatars-hover, .live2d-avatars-tap, .spine-avatars-hover, .spine-avatars-tap';
+
+/** Whether a computed color is see-through enough to show what's under it. */
+function clearColor(color: string): boolean {
+  if (color === 'transparent') return true;
+  const match = /rgba?\(([^)]*)\)/.exec(color);
+  if (!match) return false;
+  const parts = match[1]!.split(/[\s,/]+/).filter(Boolean);
+  return parts.length >= 4 && Number.parseFloat(parts[3]!) <= 0.02;
+}
+
+/**
+ * Whether an element of the app draws nothing at this viewport point, so a
+ * background model under it shows through there: no background, backdrop blur
+ * or text of its own at the point, it's not a control or media, and the point
+ * isn't on its scrollbar. That's the chat's own layout boxes (the chat body,
+ * column, message list, the empty part of a message row) where they're empty.
+ * Message cards, the input bar and any panel with a background stop a tap.
+ */
+function seeThroughAt(element: Element, clientX: number, clientY: number): boolean {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element === document.documentElement || element === document.body) return false;
+  if (element.closest(INTERACTIVE_SELECTOR)) return false;
+  const style = getComputedStyle(element);
+  if (!clearColor(style.backgroundColor) || style.backgroundImage !== 'none') return false;
+  if (style.backdropFilter && style.backdropFilter !== 'none') return false;
+  // A pointer or text cursor of the app's own (not the one the extensions set on the whole page over a model).
+  if ((style.cursor === 'pointer' || style.cursor === 'text') && !document.documentElement.matches(OWN_CURSORS)) {
+    return false;
+  }
+  // Its scrollbars: right of (or below) the content box.
+  const rect = element.getBoundingClientRect();
+  if (
+    clientX > rect.left + element.clientLeft + element.clientWidth ||
+    clientY > rect.top + element.clientTop + element.clientHeight
+  ) {
+    return false;
+  }
+  // Text right in this element (text in a child element shows up as that child).
+  const range = document.createRange();
+  for (const node of element.childNodes) {
+    if (node.nodeType !== Node.TEXT_NODE || !node.textContent?.trim()) continue;
+    range.selectNodeContents(node);
+    for (const box of range.getClientRects()) {
+      if (clientX >= box.left && clientX <= box.right && clientY >= box.top && clientY <= box.bottom) return false;
+    }
+  }
+  return true;
 }
 
 // ── Shared layers ────────────────────────────────────────────────────────────

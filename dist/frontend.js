@@ -590,13 +590,23 @@ class SharedColumns {
       canvases.forEach((canvas, index) => canvas.style.pointerEvents = previous[index]);
     }
     const hitTests = registry().hitTests ?? {};
+    const background = findLayer("background");
+    const behindChat = !!background?.querySelector(`[${OWNER_ATTRIBUTE}]`);
+    let through = false;
     for (const element of elements) {
       const extension = element.getAttribute(OWNER_ATTRIBUTE);
-      if (!extension)
+      if (!extension) {
+        if (behindChat && seeThroughAt(element, clientX, clientY)) {
+          through = true;
+          continue;
+        }
         return null;
+      }
+      if (through && element.parentElement !== background)
+        continue;
       const characterId = hitTests[extension]?.(element, clientX, clientY) ?? null;
       if (characterId)
-        return { extension, characterId };
+        return { extension, characterId, through };
     }
     return null;
   }
@@ -611,6 +621,71 @@ class SharedColumns {
     delete shared.extensions[this.extensionId];
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
+}
+var INTERACTIVE_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  "button",
+  "a[href]",
+  "label",
+  "summary",
+  "img",
+  "video",
+  "audio",
+  "canvas",
+  "svg",
+  "iframe",
+  "object",
+  "embed",
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="textbox"]',
+  '[role="menuitem"]',
+  '[role="tab"]',
+  '[role="slider"]',
+  '[role="dialog"]'
+].join(",");
+var OWN_CURSORS = ".live2d-avatars-hover, .live2d-avatars-tap, .spine-avatars-hover, .spine-avatars-tap";
+function clearColor(color) {
+  if (color === "transparent")
+    return true;
+  const match = /rgba?\(([^)]*)\)/.exec(color);
+  if (!match)
+    return false;
+  const parts = match[1].split(/[\s,/]+/).filter(Boolean);
+  return parts.length >= 4 && Number.parseFloat(parts[3]) <= 0.02;
+}
+function seeThroughAt(element, clientX, clientY) {
+  if (!(element instanceof HTMLElement))
+    return false;
+  if (element === document.documentElement || element === document.body)
+    return false;
+  if (element.closest(INTERACTIVE_SELECTOR))
+    return false;
+  const style = getComputedStyle(element);
+  if (!clearColor(style.backgroundColor) || style.backgroundImage !== "none")
+    return false;
+  if (style.backdropFilter && style.backdropFilter !== "none")
+    return false;
+  if ((style.cursor === "pointer" || style.cursor === "text") && !document.documentElement.matches(OWN_CURSORS)) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  if (clientX > rect.left + element.clientLeft + element.clientWidth || clientY > rect.top + element.clientTop + element.clientHeight) {
+    return false;
+  }
+  const range = document.createRange();
+  for (const node of element.childNodes) {
+    if (node.nodeType !== Node.TEXT_NODE || !node.textContent?.trim())
+      continue;
+    range.selectNodeContents(node);
+    for (const box of range.getClientRects()) {
+      if (clientX >= box.left && clientX <= box.right && clientY >= box.top && clientY <= box.bottom)
+        return false;
+    }
+  }
+  return true;
 }
 function findLayer(kind) {
   return document.querySelector(`[${LAYER_ATTRIBUTE}="${kind}"]`);
@@ -23838,7 +23913,9 @@ function squareThumbnail(source, size) {
 }
 
 // src/frontend/stage.ts
-var INTERACTIVE_SELECTOR = [
+var TAP_MAX_MS = 500;
+var TAP_SLOP_PX = 8;
+var INTERACTIVE_SELECTOR2 = [
   "input",
   "textarea",
   "select",
@@ -24058,6 +24135,7 @@ class Stage {
   descriptionCache = new Map;
   drag = null;
   suppressClick = false;
+  pendingTap = null;
   hoverFrame = null;
   hovering = false;
   listeners = [
@@ -24065,6 +24143,7 @@ class Stage {
     [document, "pointermove", (event) => this.onPointerMove(event), { capture: true }],
     [document, "pointerup", (event) => this.onPointerUp(event), { capture: true }],
     [document, "pointercancel", () => this.endDrag(), { capture: true }],
+    [document, "scroll", () => this.pendingTap = null, { capture: true, passive: true }],
     [document, "click", (event) => this.onClickCapture(event), { capture: true }],
     [document, "touchstart", (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
     [document, "touchmove", (event) => this.drag && event.preventDefault(), { capture: true, passive: false }]
@@ -24718,10 +24797,15 @@ class Stage {
     if (this.loaded.length === 0 || !this.gl)
       return null;
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(INTERACTIVE_SELECTOR))
+    if (target?.closest(INTERACTIVE_SELECTOR2))
       return null;
     const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
-    return hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) ?? null : null;
+    const entry = hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) : undefined;
+    return entry ? { entry, through: hit.through } : null;
+  }
+  clickDoesSomething(entry) {
+    const click = this.settingsFor(entry).animation_click;
+    return click.animation !== "none" || click.message !== "";
   }
   isOverModel(entry, stageX, stageY) {
     const point = this.toSkeletonPoint(entry, stageX, stageY);
@@ -24755,9 +24839,14 @@ class Stage {
   onPointerDown(event) {
     if (event.button !== 0)
       return;
-    const entry = this.modelAt(event);
-    if (!entry)
+    const hit = this.modelAt(event);
+    if (!hit)
       return;
+    const { entry } = hit;
+    if (hit.through) {
+      this.pendingTap = { entry, pointerId: event.pointerId, x: event.clientX, y: event.clientY, at: performance.now() };
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -24779,12 +24868,22 @@ class Stage {
       this.dragTo(drag, event);
       return;
     }
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > TAP_SLOP_PX) {
+      this.pendingTap = null;
+    }
     if (this.loaded.length === 0)
       return;
     if (event.pointerType === "mouse" && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.modelAt(event) !== null);
+        const hit = this.modelAt(event);
+        if (!hit)
+          this.setHovering(false);
+        else if (!hit.through)
+          this.setHovering("grab");
+        else
+          this.setHovering(this.clickDoesSomething(hit.entry) ? "tap" : false);
       });
     }
   }
@@ -24809,6 +24908,15 @@ class Stage {
     this.deps.layoutChanged();
   }
   onPointerUp(event) {
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId) {
+      this.pendingTap = null;
+      const selection = window.getSelection();
+      if (this.loaded.includes(pending.entry) && performance.now() - pending.at <= TAP_MAX_MS && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) <= TAP_SLOP_PX && (!selection || selection.isCollapsed)) {
+        this.onModelClick(pending.entry);
+      }
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId)
       return;
@@ -24820,6 +24928,7 @@ class Stage {
   }
   endDrag() {
     this.drag = null;
+    this.pendingTap = null;
     window.setTimeout(() => {
       this.suppressClick = false;
     }, 0);
@@ -24835,7 +24944,8 @@ class Stage {
     if (hovering === this.hovering)
       return;
     this.hovering = hovering;
-    document.documentElement.classList.toggle("spine-avatars-hover", hovering);
+    document.documentElement.classList.toggle("spine-avatars-hover", hovering === "grab");
+    document.documentElement.classList.toggle("spine-avatars-tap", hovering === "tap");
   }
   toStagePoint(event) {
     const rect = this.gl?.canvas.getBoundingClientRect();
@@ -24843,6 +24953,11 @@ class Stage {
   }
   onModelClick(entry) {
     const click = this.settingsFor(entry).animation_click;
+    const canvas = this.gl?.canvas;
+    if (canvas instanceof HTMLCanvasElement) {
+      canvas.dataset.spineTap = entry.characterId;
+      canvas.dataset.spineTaps = String(Number(canvas.dataset.spineTaps ?? 0) + 1);
+    }
     if (click.message) {
       if (this.previousInteraction.characterId === entry.characterId && this.previousInteraction.message === click.message) {
         this.deps.log("Same as last interaction, message not sent again.");
@@ -24859,6 +24974,7 @@ class Stage {
     if (this.drag)
       this.suppressClick = false;
     this.drag = null;
+    this.pendingTap = null;
     this.setHovering(false);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -25769,6 +25885,7 @@ var STAGE_CSS = `
 .spine-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .spine-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.spine-avatars-hover, html.spine-avatars-hover * { cursor: grab !important; }
+html.spine-avatars-tap, html.spine-avatars-tap * { cursor: pointer !important; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4.5" r="2"/><path d="M12 6.5v6.5"/><path d="M12 8.5l-4 2.5-1.5 3.5M12 8.5l4 2.5 1.5 3.5"/><path d="M12 13l-3 3.5L8 21M12 13l3 3.5 1 4.5"/><circle cx="12" cy="13" r=".8"/><circle cx="8" cy="11" r=".8"/><circle cx="16" cy="11" r=".8"/><circle cx="9" cy="16.5" r=".8"/><circle cx="15" cy="16.5" r=".8"/></svg>';
 function downloadJson(fileName, value) {
